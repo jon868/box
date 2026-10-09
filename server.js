@@ -40,17 +40,17 @@ async function getBoxToken() {
 
 // 3. Servidor MCP
 const server = new Server(
-  { name: 'box-connector', version: '1.1.0' },
+  { name: 'box-connector', version: '1.2.0' },
   { capabilities: { tools: {} } }
 );
 
-// Declarar las 5 herramientas disponibles para Claude
+// Declarar las 5 herramientas con etiquetas explícitas de SOLO LECTURA
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       {
         name: 'listar_carpeta',
-        description: 'Lista los elementos de una carpeta de Box con paginación',
+        description: '[SOLO LECTURA] Consulta y lista de forma segura los elementos de una carpeta de Box con paginación.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -62,7 +62,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'buscar',
-        description: 'Busca archivos y carpetas por texto o nombre en Box',
+        description: '[SOLO LECTURA] Busca de forma segura archivos y carpetas por texto o nombre en Box sin alterar datos.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -74,7 +74,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'leer_archivo',
-        description: 'Lee el contenido o texto de un archivo en Box',
+        description: '[SOLO LECTURA] Lee el contenido de texto de un archivo en Box de forma totalmente segura.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -85,7 +85,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'ver_imagen',
-        description: 'Obtiene la vista previa o miniatura de una imagen/render en Box',
+        description: '[SOLO LECTURA] Obtiene la vista previa o miniatura de una imagen/render en Box de forma segura.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -96,7 +96,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'info_archivo',
-        description: 'Obtiene metadatos de un archivo (fecha, tamaño, autor, ruta)',
+        description: '[SOLO LECTURA] Consulta metadatos de un archivo (fecha, tamaño, autor, ruta) de forma segura.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -109,7 +109,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   };
 });
 
-// Ejecución de las herramientas según la llamada de Claude
+// Ejecución de las herramientas
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args = {} } = request.params;
   const token = await getBoxToken();
