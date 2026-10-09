@@ -91,6 +91,53 @@ async function leerTextoArchivo(fileId, token) {
   return await textRes.text();
 }
 
+// Vista previa de una imagen/documento.
+// 1) Miniatura JPG de 320 px (los PNG de Box solo existen a 1024/2048 px).
+// 2) Si no hay miniatura, representación JPG de 1024x1024.
+async function obtenerVistaPrevia(fileId, token) {
+  const auth = { Authorization: `Bearer ${token}` };
+  const aBase64 = async (res) => Buffer.from(await res.arrayBuffer()).toString('base64');
+  let ultimoError = '';
+
+  // 1) Miniatura (202 = Box la está generando; reintentar)
+  for (let i = 0; i < 4; i++) {
+    const res = await fetch(
+      `https://api.box.com/2.0/files/${fileId}/thumbnail.jpg?min_width=320&min_height=320`,
+      { headers: auth, redirect: 'manual' }
+    );
+    if (res.status === 200) return { data: await aBase64(res), mimeType: 'image/jpeg' };
+    if (res.status === 202) {
+      await sleep((Number(res.headers.get('retry-after')) || 2) * 1000);
+      continue;
+    }
+    ultimoError = `miniatura: HTTP ${res.status}`;
+    break; // 302 = Box no puede generarla (redirige a un icono genérico)
+  }
+
+  // 2) Representación JPG 1024x1024
+  const infoRes = await fetch(
+    `https://api.box.com/2.0/files/${fileId}?fields=name,representations`,
+    { headers: { ...auth, 'x-rep-hints': '[jpg?dimensions=1024x1024]' } }
+  );
+  if (!infoRes.ok) throw new Error(`No se pudo consultar el archivo (${ultimoError}; info: HTTP ${infoRes.status})`);
+  const info = await infoRes.json();
+  const rep = info.representations?.entries?.find((e) => e.representation === 'jpg');
+  if (!rep) throw new Error(`Box no ofrece vista previa para "${info.name}" (${ultimoError})`);
+
+  let state = rep.status?.state;
+  for (let i = 0; i < 15 && state !== 'success'; i++) {
+    if (state === 'error' || state === 'none') break;
+    await sleep(1500);
+    const st = await fetch(rep.info.url, { headers: auth }).then((r) => r.json());
+    state = st.status?.state;
+  }
+  if (state !== 'success') throw new Error(`Box no ha podido generar la vista previa de "${info.name}" (estado: ${state})`);
+
+  const imgRes = await fetch(rep.content.url_template.replace('{+asset_path}', ''), { headers: auth });
+  if (!imgRes.ok) throw new Error(`No se pudo descargar la vista previa: HTTP ${imgRes.status}`);
+  return { data: await aBase64(imgRes), mimeType: 'image/jpeg' };
+}
+
 // 3. Servidor MCP (se crea uno por cada conexión)
 function crearServidor() {
 const server = new Server(
