@@ -38,54 +38,149 @@ async function getBoxToken() {
   return data.access_token;
 }
 
-// 3. Definición del servidor MCP
+// 3. Servidor MCP
 const server = new Server(
-  { name: 'box-connector', version: '1.0.0' },
+  { name: 'box-connector', version: '1.1.0' },
   { capabilities: { tools: {} } }
 );
 
-// Declarar las herramientas disponibles
+// Declarar las 5 herramientas disponibles para Claude
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       {
         name: 'listar_carpeta',
-        description: 'Lista los elementos dentro de una carpeta de Box',
+        description: 'Lista los elementos de una carpeta de Box con paginación',
         inputSchema: {
           type: 'object',
           properties: {
-            folder_id: { type: 'string', description: 'ID de la carpeta de Box (usa "0" para la raíz)' }
+            folder_id: { type: 'string', description: 'ID de la carpeta (por defecto "0" para la raíz)' },
+            offset: { type: 'number', description: 'Índice de inicio para paginación (por defecto 0)' },
+            limit: { type: 'number', description: 'Número de elementos a recuperar (máx 1000)' }
           }
+        }
+      },
+      {
+        name: 'buscar',
+        description: 'Busca archivos y carpetas por texto o nombre en Box',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            query: { type: 'string', description: 'Término de búsqueda (ej. "Canarias" o "GESPLAN")' },
+            ancestor_folder_ids: { type: 'string', description: 'ID de carpeta raíz donde acotar la búsqueda (opcional)' }
+          },
+          required: ['query']
+        }
+      },
+      {
+        name: 'leer_archivo',
+        description: 'Lee el contenido o texto de un archivo en Box',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            file_id: { type: 'string', description: 'ID del archivo en Box' }
+          },
+          required: ['file_id']
+        }
+      },
+      {
+        name: 'ver_imagen',
+        description: 'Obtiene la vista previa o miniatura de una imagen/render en Box',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            file_id: { type: 'string', description: 'ID del archivo de imagen en Box' }
+          },
+          required: ['file_id']
+        }
+      },
+      {
+        name: 'info_archivo',
+        description: 'Obtiene metadatos de un archivo (fecha, tamaño, autor, ruta)',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            file_id: { type: 'string', description: 'ID del archivo en Box' }
+          },
+          required: ['file_id']
         }
       }
     ]
   };
 });
 
-// Ejecución de las herramientas
+// Ejecución de las herramientas según la llamada de Claude
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  if (request.params.name === 'listar_carpeta') {
-    const folderId = request.params.arguments?.folder_id || '0';
-    const token = await getBoxToken();
-    
-    const boxRes = await fetch(`https://api.box.com/2.0/folders/${folderId}/items`, {
-      headers: { Authorization: `Bearer ${token}` }
-    });
-    const boxData = await boxRes.json();
+  const { name, arguments: args = {} } = request.params;
+  const token = await getBoxToken();
 
-    return {
-      content: [
-        {
-          type: 'text',
-          text: JSON.stringify(boxData, null, 2)
-        }
-      ]
-    };
+  switch (name) {
+    case 'listar_carpeta': {
+      const folderId = args.folder_id || '0';
+      const offset = args.offset || 0;
+      const limit = Math.min(args.limit || 100, 1000);
+      const res = await fetch(`https://api.box.com/2.0/folders/${folderId}/items?offset=${offset}&limit=${limit}&fields=id,type,name,size,modified_at`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      const data = await res.json();
+      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    }
+
+    case 'buscar': {
+      let url = `https://api.box.com/2.0/search?query=${encodeURIComponent(args.query)}`;
+      if (args.ancestor_folder_ids) {
+        url += `&ancestor_folder_ids=${encodeURIComponent(args.ancestor_folder_ids)}`;
+      }
+      const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+      const data = await res.json();
+      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    }
+
+    case 'leer_archivo': {
+      const res = await fetch(`https://api.box.com/2.0/files/${args.file_id}/content`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (!res.ok) {
+        throw new Error(`No se pudo leer el archivo: ${res.statusText}`);
+      }
+      const text = await res.text();
+      return { content: [{ type: 'text', text: text.slice(0, 50000) }] };
+    }
+
+    case 'ver_imagen': {
+      const res = await fetch(`https://api.box.com/2.0/files/${args.file_id}/thumbnail.png?min_height=320&min_width=320`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (!res.ok) {
+        throw new Error('No se pudo generar la vista previa de la imagen.');
+      }
+      const buffer = await res.arrayBuffer();
+      const base64 = Buffer.from(buffer).toString('base64');
+      return {
+        content: [
+          {
+            type: 'image',
+            data: base64,
+            mimeType: 'image/png'
+          }
+        ]
+      };
+    }
+
+    case 'info_archivo': {
+      const res = await fetch(`https://api.box.com/2.0/files/${args.file_id}?fields=id,name,description,size,created_at,modified_at,created_by,path_collection`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      const data = await res.json();
+      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    }
+
+    default:
+      throw new Error(`Herramienta no encontrada: ${name}`);
   }
-  throw new Error(`Herramienta no encontrada: ${request.params.name}`);
 });
 
-// 4. Transporte HTTP / SSE para Claude
+// 4. Transporte HTTP / SSE
 let transport;
 app.get('/mcp', async (req, res) => {
   transport = new SSEServerTransport('/mcp/messages', res);
