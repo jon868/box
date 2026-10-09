@@ -1,0 +1,13 @@
+{
+  "name": "mcp-box-connector",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "@modelcontextprotocol/sdk": "^0.6.0",
+    "box-node-sdk": "^2.0.0"
+  }
+}
