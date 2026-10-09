@@ -210,16 +210,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
 
     case 'ver_imagen': {
-      const res = await fetch(
-        `https://api.box.com/2.0/files/${args.file_id}/thumbnail.png?min_height=320&min_width=320`,
-        { headers: auth }
-      );
-      if (!res.ok) {
-        throw new Error('No se pudo generar la vista previa de la imagen.');
-      }
-      const buffer = await res.arrayBuffer();
-      const base64 = Buffer.from(buffer).toString('base64');
-      return { content: [{ type: 'image', data: base64, mimeType: 'image/png' }] };
+      const { data, mimeType } = await obtenerVistaPrevia(args.file_id, token);
+      return { content: [{ type: 'image', data, mimeType }] };
     }
 
     case 'info_archivo': {
