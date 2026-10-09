@@ -48,6 +48,26 @@ async function getBoxToken() {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Espera a que Box tenga lista una representación (texto extraído, JPG...).
+// Estado "none" = Box aún no la ha generado: se genera al pedirla, así que
+// se solicita y luego se consulta su estado hasta que esté lista (~30 s máx).
+async function esperarRepresentacion(rep, auth) {
+  let state = rep.status?.state;
+  if (state === 'success') return state;
+  if (state === 'none') {
+    const urlContenido = rep.content.url_template.replace('{+asset_path}', '');
+    await fetch(rep.info.url, { headers: auth });
+    await fetch(urlContenido, { headers: auth }); // dispara la generación (devuelve 202)
+  }
+  for (let i = 0; i < 20; i++) {
+    const st = await fetch(rep.info.url, { headers: auth }).then((r) => r.json());
+    state = st.status?.state;
+    if (state === 'success' || state === 'error') break;
+    await sleep(1500);
+  }
+  return state;
+}
+
 // Lee el texto de cualquier archivo (PDF, DOCX, XLSX, PPTX...) usando la
 // representación "extracted_text" de Box. Para texto plano lee el contenido directo.
 async function leerTextoArchivo(fileId, token) {
@@ -73,14 +93,7 @@ async function leerTextoArchivo(fileId, token) {
     return `[${info.name}] Box no ofrece extracción de texto para archivos .${ext}. Si es una imagen, usa ver_imagen.`;
   }
 
-  // Esperar a que Box genere la representación si aún no existe
-  let state = rep.status?.state;
-  for (let i = 0; i < 15 && state !== 'success'; i++) {
-    if (state === 'error' || state === 'none') break;
-    await sleep(1500);
-    const st = await fetch(rep.info.url, { headers: auth }).then((r) => r.json());
-    state = st.status?.state;
-  }
+  const state = await esperarRepresentacion(rep, auth);
   if (state !== 'success') {
     return `[${info.name}] Box no ha podido extraer el texto (estado: ${state}).`;
   }
@@ -124,13 +137,7 @@ async function obtenerVistaPrevia(fileId, token) {
   const rep = info.representations?.entries?.find((e) => e.representation === 'jpg');
   if (!rep) throw new Error(`Box no ofrece vista previa para "${info.name}" (${ultimoError})`);
 
-  let state = rep.status?.state;
-  for (let i = 0; i < 15 && state !== 'success'; i++) {
-    if (state === 'error' || state === 'none') break;
-    await sleep(1500);
-    const st = await fetch(rep.info.url, { headers: auth }).then((r) => r.json());
-    state = st.status?.state;
-  }
+  const state = await esperarRepresentacion(rep, auth);
   if (state !== 'success') throw new Error(`Box no ha podido generar la vista previa de "${info.name}" (estado: ${state})`);
 
   const imgRes = await fetch(rep.content.url_template.replace('{+asset_path}', ''), { headers: auth });
