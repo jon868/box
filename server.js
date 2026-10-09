@@ -6,7 +6,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 const app = express();
 
 // 1. Validación de seguridad (static_headers de Claude)
-const API_KEY = process.env.MCP_API_KEY; 
+const API_KEY = process.env.MCP_API_KEY;
 app.use((req, res, next) => {
   const authHeader = req.headers['authorization'] || req.headers['x-api-key'];
   if (authHeader !== `Bearer ${API_KEY}` && authHeader !== API_KEY) {
@@ -15,8 +15,13 @@ app.use((req, res, next) => {
   next();
 });
 
-// 2. Función para obtener el token de Box (Client Credentials Grant)
+// 2. Token de Box (Client Credentials Grant) con caché
+let cachedToken = null;
+let tokenExpiresAt = 0;
+
 async function getBoxToken() {
+  if (cachedToken && Date.now() < tokenExpiresAt) return cachedToken;
+
   const params = new URLSearchParams({
     grant_type: 'client_credentials',
     client_id: process.env.BOX_CLIENT_ID,
@@ -30,27 +35,84 @@ async function getBoxToken() {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: params.toString()
   });
-  
+
   const data = await response.json();
   if (!response.ok) {
     throw new Error(`Error de autenticación Box: ${JSON.stringify(data)}`);
   }
-  return data.access_token;
+  cachedToken = data.access_token;
+  // Renovar 5 minutos antes de que caduque
+  tokenExpiresAt = Date.now() + ((data.expires_in || 3600) - 300) * 1000;
+  return cachedToken;
 }
 
-// 3. Servidor MCP
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Lee el texto de cualquier archivo (PDF, DOCX, XLSX, PPTX...) usando la
+// representación "extracted_text" de Box. Para texto plano lee el contenido directo.
+async function leerTextoArchivo(fileId, token) {
+  const auth = { Authorization: `Bearer ${token}` };
+  const TEXTO_PLANO = ['txt', 'csv', 'tsv', 'md', 'json', 'xml', 'html', 'htm', 'js', 'php', 'css', 'log', 'yml', 'yaml'];
+
+  const infoRes = await fetch(
+    `https://api.box.com/2.0/files/${fileId}?fields=name,extension,representations`,
+    { headers: { ...auth, 'x-rep-hints': '[extracted_text]' } }
+  );
+  if (!infoRes.ok) throw new Error(`No se pudo consultar el archivo: ${infoRes.status} ${infoRes.statusText}`);
+  const info = await infoRes.json();
+  const ext = (info.extension || '').toLowerCase();
+
+  if (TEXTO_PLANO.includes(ext)) {
+    const res = await fetch(`https://api.box.com/2.0/files/${fileId}/content`, { headers: auth });
+    if (!res.ok) throw new Error(`No se pudo leer el archivo: ${res.statusText}`);
+    return await res.text();
+  }
+
+  const rep = info.representations?.entries?.find((e) => e.representation === 'extracted_text');
+  if (!rep) {
+    return `[${info.name}] Box no ofrece extracción de texto para archivos .${ext}. Si es una imagen, usa ver_imagen.`;
+  }
+
+  // Esperar a que Box genere la representación si aún no existe
+  let state = rep.status?.state;
+  for (let i = 0; i < 15 && state !== 'success'; i++) {
+    if (state === 'error' || state === 'none') break;
+    await sleep(1500);
+    const st = await fetch(rep.info.url, { headers: auth }).then((r) => r.json());
+    state = st.status?.state;
+  }
+  if (state !== 'success') {
+    return `[${info.name}] Box no ha podido extraer el texto (estado: ${state}).`;
+  }
+
+  const url = rep.content.url_template.replace('{+asset_path}', '');
+  const textRes = await fetch(url, { headers: auth });
+  if (!textRes.ok) throw new Error(`No se pudo descargar el texto extraído: ${textRes.statusText}`);
+  return await textRes.text();
+}
+
+// 3. Servidor MCP (se crea uno por cada conexión)
+function crearServidor() {
 const server = new Server(
-  { name: 'box-connector', version: '1.2.0' },
+  { name: 'box-connector', version: '1.3.0' },
   { capabilities: { tools: {} } }
 );
 
-// Declarar las 5 herramientas con etiquetas explícitas de SOLO LECTURA
+// Anotaciones MCP estándar: indican al cliente que la herramienta solo lee
+const SOLO_LECTURA = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: true
+};
+
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       {
         name: 'listar_carpeta',
-        description: '[SOLO LECTURA] Consulta y lista de forma segura los elementos de una carpeta de Box con paginación.',
+        description: '[SOLO LECTURA] Lista los elementos de una carpeta de Box con paginación.',
+        annotations: { title: 'Listar carpeta de Box', ...SOLO_LECTURA },
         inputSchema: {
           type: 'object',
           properties: {
@@ -62,7 +124,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'buscar',
-        description: '[SOLO LECTURA] Busca de forma segura archivos y carpetas por texto o nombre en Box sin alterar datos.',
+        description: '[SOLO LECTURA] Busca archivos y carpetas por texto o nombre en Box.',
+        annotations: { title: 'Buscar en Box', ...SOLO_LECTURA },
         inputSchema: {
           type: 'object',
           properties: {
@@ -74,7 +137,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'leer_archivo',
-        description: '[SOLO LECTURA] Lee el contenido de texto de un archivo en Box de forma totalmente segura.',
+        description: '[SOLO LECTURA] Lee el texto de un archivo de Box (PDF, Word, Excel, PowerPoint, texto plano...).',
+        annotations: { title: 'Leer archivo de Box', ...SOLO_LECTURA },
         inputSchema: {
           type: 'object',
           properties: {
@@ -85,7 +149,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'ver_imagen',
-        description: '[SOLO LECTURA] Obtiene la vista previa o miniatura de una imagen/render en Box de forma segura.',
+        description: '[SOLO LECTURA] Obtiene la vista previa o miniatura de una imagen/render en Box.',
+        annotations: { title: 'Ver imagen de Box', ...SOLO_LECTURA },
         inputSchema: {
           type: 'object',
           properties: {
@@ -96,7 +161,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: 'info_archivo',
-        description: '[SOLO LECTURA] Consulta metadatos de un archivo (fecha, tamaño, autor, ruta) de forma segura.',
+        description: '[SOLO LECTURA] Consulta metadatos de un archivo (fecha, tamaño, autor, ruta).',
+        annotations: { title: 'Info de archivo de Box', ...SOLO_LECTURA },
         inputSchema: {
           type: 'object',
           properties: {
@@ -113,15 +179,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args = {} } = request.params;
   const token = await getBoxToken();
+  const auth = { Authorization: `Bearer ${token}` };
 
   switch (name) {
     case 'listar_carpeta': {
       const folderId = args.folder_id || '0';
       const offset = args.offset || 0;
       const limit = Math.min(args.limit || 100, 1000);
-      const res = await fetch(`https://api.box.com/2.0/folders/${folderId}/items?offset=${offset}&limit=${limit}&fields=id,type,name,size,modified_at`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
+      const res = await fetch(
+        `https://api.box.com/2.0/folders/${folderId}/items?offset=${offset}&limit=${limit}&fields=id,type,name,size,modified_at`,
+        { headers: auth }
+      );
       const data = await res.json();
       return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
     }
@@ -131,46 +199,34 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       if (args.ancestor_folder_ids) {
         url += `&ancestor_folder_ids=${encodeURIComponent(args.ancestor_folder_ids)}`;
       }
-      const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+      const res = await fetch(url, { headers: auth });
       const data = await res.json();
       return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
     }
 
     case 'leer_archivo': {
-      const res = await fetch(`https://api.box.com/2.0/files/${args.file_id}/content`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-      if (!res.ok) {
-        throw new Error(`No se pudo leer el archivo: ${res.statusText}`);
-      }
-      const text = await res.text();
+      const text = await leerTextoArchivo(args.file_id, token);
       return { content: [{ type: 'text', text: text.slice(0, 50000) }] };
     }
 
     case 'ver_imagen': {
-      const res = await fetch(`https://api.box.com/2.0/files/${args.file_id}/thumbnail.png?min_height=320&min_width=320`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
+      const res = await fetch(
+        `https://api.box.com/2.0/files/${args.file_id}/thumbnail.png?min_height=320&min_width=320`,
+        { headers: auth }
+      );
       if (!res.ok) {
         throw new Error('No se pudo generar la vista previa de la imagen.');
       }
       const buffer = await res.arrayBuffer();
       const base64 = Buffer.from(buffer).toString('base64');
-      return {
-        content: [
-          {
-            type: 'image',
-            data: base64,
-            mimeType: 'image/png'
-          }
-        ]
-      };
+      return { content: [{ type: 'image', data: base64, mimeType: 'image/png' }] };
     }
 
     case 'info_archivo': {
-      const res = await fetch(`https://api.box.com/2.0/files/${args.file_id}?fields=id,name,description,size,created_at,modified_at,created_by,path_collection`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
+      const res = await fetch(
+        `https://api.box.com/2.0/files/${args.file_id}?fields=id,name,description,size,created_at,modified_at,created_by,path_collection`,
+        { headers: auth }
+      );
       const data = await res.json();
       return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
     }
@@ -180,18 +236,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-// 4. Transporte HTTP / SSE
-let transport;
+return server;
+}
+
+// 4. Transporte HTTP / SSE — un transporte por sesión (antes había uno global
+// y una segunda conexión pisaba a la primera)
+const transports = {};
+
 app.get('/mcp', async (req, res) => {
-  transport = new SSEServerTransport('/mcp/messages', res);
-  await server.connect(transport);
+  const transport = new SSEServerTransport('/mcp/messages', res);
+  transports[transport.sessionId] = transport;
+  res.on('close', () => delete transports[transport.sessionId]);
+  await crearServidor().connect(transport);
 });
 
 app.post('/mcp/messages', async (req, res) => {
+  const transport = transports[req.query.sessionId];
   if (transport) {
     await transport.handlePostMessage(req, res);
   } else {
-    res.status(400).send('Transporte SSE no inicializado');
+    res.status(400).send('Sesión SSE no encontrada');
   }
 });
 
