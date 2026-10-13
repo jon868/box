@@ -1,13 +1,19 @@
 {
-  "name": "mcp-box-connector",
-  "version": "1.0.0",
-  "type": "module",
+  "name": "box-alegria-mcp",
+  "version": "2.0.0",
+  "description": "Conector MCP de Box para Claude con cuenta de servicio (Client Credentials Grant)",
+  "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "@modelcontextprotocol/sdk": "^0.6.0",
-    "box-node-sdk": "^2.0.0"
-  }
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "express": "^5.3.0",
+    "zod": "^4.6.7"
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "private": true
 }
