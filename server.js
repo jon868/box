@@ -520,7 +520,7 @@ async function handleMcp(req, res) {
 app.all(["/mcp/:key", "/mcp"], handleMcp);
 
 checkConfig();
-app.listen(CFG.port, () => {
+app.listen(CFG.port, "0.0.0.0", () => {
   console.log(
     `Box_alegria MCP escuchando en :${CFG.port} — escritura ${CFG.enableWrite ? "ACTIVADA" : "desactivada"}` +
       (CFG.allowedFolders.length ? `, carpetas permitidas: ${CFG.allowedFolders.join(", ")}` : ", sin restricción de carpetas")
