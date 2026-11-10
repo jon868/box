@@ -27,6 +27,11 @@ const CFG = {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean),
+  // Índice de fotos etiquetadas (lo genera el servicio de etiquetado: indice.json)
+  indiceUrl: env.INDICE_URL,
+  indiceUser: env.INDICE_USUARIO,
+  indicePassword: env.INDICE_PASSWORD,
+  indiceRefrescoMin: Number(env.INDICE_REFRESCO_MIN || 60),
   apiBase: env.BOX_API_BASE || "https://api.box.com/2.0",
   uploadBase: env.BOX_UPLOAD_BASE || "https://upload.box.com/api/2.0",
   tokenUrl: env.BOX_TOKEN_URL || "https://api.box.com/oauth2/token",
@@ -208,6 +213,70 @@ async function downloadFile(fileId) {
   if (!res.ok) throw new BoxError(res.status, `Error descargando el archivo (${res.status})`);
   return res;
 }
+
+// ---------------------------------------------------------------------------
+// Índice de fotos etiquetadas (buscar_fotos)
+// ---------------------------------------------------------------------------
+const FLOTA = ["13,80", "Airstream", "CajaMar", "Camión rígido", "Cotazero", "Furgón", "Plataformas", "Semirremolque", "Set TV"];
+const PLANOS = ["exterior del vehículo", "interior del vehículo", "evento con público", "montaje o producción", "detalle", "retrato o equipo", "otro"];
+const LINEAS = ["Roadshow", "Acciones pedagógicas y sensibilización", "Marca y patrocinio", "Promoción y producto", "Manufacturing", "Agencia"];
+const PARADAS = new Set(
+  "de la el los las del y en un una con para por al a o u que se sin sobre entre tipo foto fotos imagen imagenes".split(" ")
+);
+const norm = (t) =>
+  String(t || "")
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .toLowerCase();
+const palabras = (t) => norm(t).split(/[^a-z0-9ñ]+/).filter((w) => w.length > 1 && !PARADAS.has(w));
+
+let indice = { fotos: [], generado: null, cargadoEn: null, error: null };
+
+async function cargarIndice() {
+  if (!CFG.indiceUrl) return;
+  try {
+    const headers = {};
+    if (CFG.indiceUser)
+      headers.Authorization = "Basic " + Buffer.from(`${CFG.indiceUser}:${CFG.indicePassword || ""}`).toString("base64");
+    const res = await fetch(CFG.indiceUrl, { headers, signal: AbortSignal.timeout(60_000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const fotos = (data.fotos || []).map((f) => ({
+      ...f,
+      // texto ya normalizado por campos, con peso distinto en la puntuación
+      _alto: new Set(palabras([f.marca, f.cliente, (f.palabras || []).join(" "), f.vehiculo, f.vehiculo_campana].join(" "))),
+      _medio: new Set(palabras([f.descripcion, f.campana, (f.lineas || []).join(" "), f.plano, f.tipo_vehiculo].join(" "))),
+      _bajo: new Set(palabras([f.nombre, f.carpetas].join(" "))),
+    }));
+    indice = { fotos, generado: data.generado || null, cargadoEn: new Date().toISOString(), error: null };
+    console.log(`Índice de fotos cargado: ${fotos.length} fotos (generado ${indice.generado})`);
+  } catch (e) {
+    indice.error = e.message;
+    console.error("[índice] no se pudo cargar:", e.message, indice.fotos.length ? "(sigo con el anterior)" : "");
+  }
+}
+
+// Coincidencia flexible: exacta, o por prefijo en palabras de 4+ letras (singular/plural, género…)
+function puntuar(f, terminos) {
+  let total = 0;
+  let encontrados = 0;
+  for (const t of terminos) {
+    let p = 0;
+    for (const [conj, peso] of [[f._alto, 3], [f._medio, 2], [f._bajo, 1]]) {
+      if (conj.has(t)) p = Math.max(p, peso);
+      else if (t.length >= 4) for (const w of conj) if (w.length >= 4 && (w.startsWith(t) || t.startsWith(w))) { p = Math.max(p, peso - 0.5); break; }
+    }
+    if (p) encontrados++;
+    total += p;
+  }
+  return { total, encontrados };
+}
+
+const contar = (lista, clave) => {
+  const c = new Map();
+  for (const f of lista) for (const v of [].concat(clave(f) || [])) if (v) c.set(v, (c.get(v) || 0) + 1);
+  return Object.fromEntries([...c.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8));
+};
 
 // ---------------------------------------------------------------------------
 // Herramientas MCP
@@ -397,6 +466,102 @@ function buildServer() {
     })
   );
 
+  server.registerTool(
+    "buscar_fotos",
+    {
+      title: "Buscar fotos de campañas",
+      description:
+        "Busca en el índice de fotos etiquetadas del archivo de alegria-activity (fotos de campañas en Box, " +
+        "descritas automáticamente). Combina texto libre (descripción, palabras clave, marca, cliente) con filtros. " +
+        "Por defecto excluye fotos con posibles menores y fotos no aptas para propuesta. Devuelve el id de Box de cada " +
+        "foto: para enseñarla usa box_get_image. Las etiquetas son automáticas: confirma con la imagen antes de afirmar algo.",
+      inputSchema: {
+        texto: z.string().optional().describe("Palabras a buscar, p. ej. 'pantallas interior realidad virtual'"),
+        vehiculo: z.enum(FLOTA).optional().describe("Vehículo de la flota (en la foto o asignado a su campaña)"),
+        plano: z.enum(PLANOS).optional(),
+        linea: z.enum(LINEAS).optional().describe("Línea de servicio"),
+        cliente: z.string().optional().describe("Cliente o campaña (parte del nombre de la carpeta)"),
+        marca: z.string().optional().describe("Marca visible en la foto"),
+        anio_desde: z.number().int().optional(),
+        anio_hasta: z.number().int().optional(),
+        excluir_menores: z.boolean().default(true).describe("Quitar fotos con posibles menores (sí o dudoso)"),
+        solo_aptas: z.boolean().default(true).describe("Solo fotos aptas para enseñar a un cliente"),
+        solo_publicadas: z.boolean().default(false).describe("Solo fotos ya publicadas en la web"),
+        limit: z.number().int().min(1).max(50).default(12),
+        offset: z.number().int().min(0).default(0),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    safe(async (a) => {
+      if (!CFG.indiceUrl) return fail("El buscador de fotos no está configurado (falta INDICE_URL).");
+      if (!indice.fotos.length) {
+        await cargarIndice();
+        if (!indice.fotos.length) return fail(`El índice de fotos no está disponible${indice.error ? `: ${indice.error}` : ""}.`);
+      }
+      const nc = a.cliente ? norm(a.cliente) : null;
+      const nm = a.marca ? norm(a.marca) : null;
+      let excluidasMenores = 0;
+      let excluidasNoAptas = 0;
+      const base = indice.fotos.filter((f) => {
+        if (a.vehiculo && f.vehiculo !== a.vehiculo && !(f.vehiculo_campana || "").split(", ").includes(a.vehiculo)) return false;
+        if (a.plano && f.plano !== a.plano) return false;
+        if (a.linea && !(f.lineas || []).includes(a.linea)) return false;
+        if (nc && !norm(`${f.cliente} ${f.campana} ${f.carpetas}`).includes(nc)) return false;
+        if (nm && !norm(f.marca).includes(nm)) return false;
+        if (a.anio_desde && !(f.anio >= a.anio_desde)) return false;
+        if (a.anio_hasta && !(f.anio <= a.anio_hasta)) return false;
+        if (a.solo_publicadas && f.uso !== "publicada en web") return false;
+        return true;
+      });
+      const terminos = palabras(a.texto);
+      let lista = base;
+      if (terminos.length) {
+        const minimo = Math.max(1, Math.ceil(terminos.length / 2));
+        lista = base
+          .map((f) => ({ f, ...puntuar(f, terminos) }))
+          .filter((x) => x.encontrados >= minimo)
+          .sort((x, y) => y.encontrados - x.encontrados || y.total - x.total || (y.f.anio || 0) - (x.f.anio || 0))
+          .map((x) => x.f);
+      } else {
+        lista = [...base].sort((x, y) => (y.anio || 0) - (x.anio || 0));
+      }
+      // las exclusiones se cuentan sobre lo que coincide con la búsqueda
+      lista = lista.filter((f) => {
+        if (a.excluir_menores && (f.menores === "sí" || f.menores === "dudoso")) return (excluidasMenores++, false);
+        if (a.solo_aptas && !f.apta) return (excluidasNoAptas++, false);
+        return true;
+      });
+      const pagina = lista.slice(a.offset, a.offset + a.limit).map((f) => ({
+        id: f.id,
+        nombre: f.nombre,
+        campana: f.campana,
+        anio: f.anio,
+        vehiculo: f.vehiculo,
+        ...(f.vehiculo_campana && { vehiculo_campana: `${f.vehiculo_campana} (confianza ${f.conf_vehiculo_campana || "?"}, sin confirmar)` }),
+        plano: f.plano,
+        lineas: f.lineas,
+        marca: f.marca,
+        descripcion: f.descripcion,
+        menores: f.menores,
+        uso: f.uso,
+        enlace: `https://app.box.com/file/${f.id}`,
+      }));
+      return ok({
+        total: lista.length,
+        offset: a.offset,
+        mostrando: pagina.length,
+        excluidas: { posibles_menores: excluidasMenores, no_aptas: excluidasNoAptas },
+        resumen: {
+          por_campana: contar(lista, (f) => f.campana),
+          por_vehiculo: contar(lista, (f) => f.vehiculo_campana || (FLOTA.includes(f.vehiculo) ? f.vehiculo : null)),
+          por_anio: contar(lista, (f) => (f.anio ? String(f.anio) : null)),
+        },
+        indice: { fotos: indice.fotos.length, generado: indice.generado },
+        fotos: pagina,
+      });
+    })
+  );
+
   if (CFG.enableWrite) {
     const RW = { readOnlyHint: false, destructiveHint: false, openWorldHint: true };
 
@@ -486,7 +651,15 @@ app.get(["/health/box/:key", "/health/box"], async (req, res) => {
   try {
     await getToken(true);
     const me = await box("/users/me", { query: { fields: "id,name,login" } });
-    res.json({ ok: true, box_user: me, write_enabled: CFG.enableWrite, allowed_folders: CFG.allowedFolders });
+    res.json({
+      ok: true,
+      box_user: me,
+      write_enabled: CFG.enableWrite,
+      allowed_folders: CFG.allowedFolders,
+      indice_fotos: CFG.indiceUrl
+        ? { fotos: indice.fotos.length, generado: indice.generado, cargado_en: indice.cargadoEn, error: indice.error }
+        : "no configurado",
+    });
   } catch (e) {
     res.status(502).json({ ok: false, error: e.message });
   }
@@ -520,6 +693,10 @@ async function handleMcp(req, res) {
 app.all(["/mcp/:key", "/mcp"], handleMcp);
 
 checkConfig();
+if (CFG.indiceUrl) {
+  cargarIndice();
+  setInterval(cargarIndice, Math.max(5, CFG.indiceRefrescoMin) * 60_000).unref();
+}
 app.listen(CFG.port, "0.0.0.0", () => {
   console.log(
     `Box_alegria MCP escuchando en :${CFG.port} — escritura ${CFG.enableWrite ? "ACTIVADA" : "desactivada"}` +
