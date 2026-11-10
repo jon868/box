@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Piloto de etiquetado de fotos de Box con la API de Claude (Batch API) · versión 5
+Piloto de etiquetado de fotos de Box con la API de Claude (Batch API) · versión 6
 alegria-activity
 
 Uso:
@@ -43,7 +43,7 @@ except ImportError:
 
 load_dotenv()
 
-VERSION = "v5"
+VERSION = "v6"
 
 # ---------------------------------------------------------------- configuración
 API = "https://api.box.com/2.0"
@@ -88,7 +88,8 @@ REFERENCIAS = [
     ("Furgón", "2400253604413", "furgoneta grande con carrocería tipo caja, puerta lateral, escalera y toldo"),
     ("Camión rígido", "2400250967290", "camión rígido con caja expositiva de laterales acristalados"),
     ("Semirremolque", "2400249539182", "tráiler de gran tamaño con laterales expandibles"),
-    ("13,80", "2400262689058", "vehículo de 13,80 m con aspecto de autocar"),
+    ("13,80", "2400258558297", "autocar de 3 ejes con el lateral DESPLEGADO: un módulo saliente de altura completa"),
+    ("13,80", "2400251061395", "el mismo 13,80 desplegado, otra campaña: lo distintivo es el módulo lateral que sale"),
     ("CajaMar", "2400551454784", "camión carrozado con escalera y rampa de acceso lateral"),
     ("Plataformas", "2400244907579", "módulo-remolque blanco grande tipo sala, con ventanas"),
     ("Set TV", "2400249995707", "módulo plató de TV con terraza superior"),
@@ -799,9 +800,13 @@ vehículos propios de la agencia ({", ".join(FLOTA)}; de Cotazero no hay foto) y
 En una campaña se suele usar un mismo vehículo. Di qué vehículo o vehículos de la flota aparecen en las fotos de \
 la campaña, comparando forma, proporciones, número de ejes, cabina, partes expandibles y estructura con las \
 referencias. La rotulación cambia en cada campaña: no te fíes de colores ni logotipos. Muchas campañas usan \
-unidades fabricadas para el cliente o vehículos alquilados que NO son de la flota: en ese caso marca \
-ninguno_de_la_flota = true. Si no estás seguro, confianza "baja". Llama directamente a la herramienta \
-guardar_vehiculo, sin escribir texto antes."""
+unidades fabricadas para el cliente, vehículos alquilados o vehículos antiguos de la agencia que ya no existen \
+(autobuses de 12 o 15 m, tráileres antiguos...): todos esos NO son de la flota actual; marca \
+ninguno_de_la_flota = true e indica su tipo en tipo_si_no_flota.
+Regla del 13,80: es un autocar cuyo lateral se DESPLIEGA formando un módulo saliente. Elige 13,80 solo si en \
+alguna foto se ve ese lateral desplegado, o las juntas y guías del módulo cuando está cerrado. Un autobús o \
+autocar sin lateral desplegable NO es el 13,80: es "autobús".
+Si no estás seguro, confianza "baja". Llama directamente a la herramienta guardar_vehiculo, sin escribir texto antes."""
 
 HERRAMIENTA_FLOTA = {
     "name": "guardar_vehiculo",
@@ -811,6 +816,9 @@ HERRAMIENTA_FLOTA = {
         "properties": {
             "vehiculos": {"type": "array", "maxItems": 3, "items": {"type": "string", "enum": FLOTA}},
             "ninguno_de_la_flota": {"type": "boolean"},
+            "tipo_si_no_flota": {"type": "string", "enum": [
+                "autobús", "tráiler o semirremolque", "camión", "furgoneta", "remolque o caravana", "otro", ""]},
+            "lateral_desplegable_visible": {"type": "boolean"},
             "confianza": {"type": "string", "enum": ["alta", "media", "baja"]},
             "explicacion": {"type": "string", "description": "1-2 frases: en qué rasgos te basas."},
         },
@@ -837,12 +845,28 @@ def elegir_fotos_campana(filas):
     return interiores[:2]
 
 
+def vehiculos_de(texto):
+    """'13,80, Semirremolque' -> ['13,80', 'Semirremolque'] (ojo: '13,80' lleva coma)."""
+    return [v.strip() for v in (texto or "").split(", ") if v.strip()]
+
+
 def cmd_flota(args):
-    if not (LOTES_FLOTA.exists() and not args.forzar):
+    revisar = getattr(args, "revisar", None)
+    if revisar or not (LOTES_FLOTA.exists() and not args.forzar):
         filas = [f for f in leer_resultados() if not f.get("modelo") or f["modelo"] == MODELOS[0]]
         por_campana = {}
         for f in filas:
             por_campana.setdefault(f.get("campana") or campana_de(f["carpetas"].split(" | ")[0]), []).append(f)
+        if revisar:
+            if not FLOTA_CSV.exists():
+                sys.exit("No hay flota_campanas.csv que revisar: ejecuta antes 'flota'.")
+            with FLOTA_CSV.open(encoding="utf-8-sig") as fh:
+                previas = list(csv.DictReader(fh))
+            objetivo = {r["campana"] for r in previas if revisar in vehiculos_de(r["vehiculos"])}
+            (DATA / "flota_campanas_anterior.csv").write_bytes(FLOTA_CSV.read_bytes())
+            por_campana = {c: fs for c, fs in por_campana.items() if c in objetivo}
+            print(f"Revisando {len(por_campana)} campañas asignadas a «{revisar}» "
+                  f"(copia de la versión anterior en flota_campanas_anterior.csv)")
         elegidas = {c: elegir_fotos_campana(fs) for c, fs in por_campana.items()}
         sin = sorted(c for c, fs in elegidas.items() if not fs)
         elegidas = {c: fs for c, fs in elegidas.items() if fs}
@@ -856,7 +880,7 @@ def cmd_flota(args):
         if not args.si and input("¿Enviar? [s/N] ").strip().lower() not in ("s", "si", "sí"):
             sys.exit("Cancelado. No se ha enviado nada.")
         cliente = anthropic.Anthropic(api_key=entorno("ANTHROPIC_API_KEY"))
-        estado = {"lotes": [], "campanas": {}}
+        estado = {"lotes": [], "campanas": {}, "revision": bool(revisar)}
         claves = sorted(elegidas)
         tam = max(1, int(MAX_MB_LOTE * 1024 * 1024 / (len(json.dumps(refs)) + FOTOS_POR_CAMPANA * 450_000)))
         for k in range(0, len(claves), tam):
@@ -906,7 +930,8 @@ def cmd_flota_recoger(_args):
             info = estado["campanas"].get(r.custom_id, {})
             fila = {"campana": info.get("campana", r.custom_id), "n_fotos": info.get("n_fotos", ""),
                     "fotos_usadas": " ".join(f"https://app.box.com/file/{x}" for x in info.get("fotos", [])),
-                    "vehiculos": "", "ninguno_de_la_flota": "", "confianza": "", "explicacion": "",
+                    "vehiculos": "", "ninguno_de_la_flota": "", "tipo_si_no_flota": "",
+                    "lateral_desplegable": "", "confianza": "", "explicacion": "",
                     "confirmado": "", "vehiculo_correcto": ""}
             if r.result.type == "succeeded":
                 msg = r.result.message
@@ -921,12 +946,32 @@ def cmd_flota_recoger(_args):
                     except ValueError:
                         d = {"explicacion": "ERROR: respuesta sin ficha"}
                 validos = [v for v in (d.get("vehiculos") or []) if v in FLOTA]
+                desplegable = d.get("lateral_desplegable_visible")
+                tipo = d.get("tipo_si_no_flota") or ""
+                # regla del 13,80: sin lateral desplegable visible es un autobús, no el 13,80
+                if "13,80" in validos and desplegable is False:
+                    validos.remove("13,80")
+                    tipo = tipo or "autobús"
+                ninguno = bool(d.get("ninguno_de_la_flota")) or not validos
                 fila.update(vehiculos=", ".join(validos),
-                            ninguno_de_la_flota="sí" if d.get("ninguno_de_la_flota") else "no",
+                            ninguno_de_la_flota="sí" if ninguno else "no",
+                            tipo_si_no_flota=tipo if ninguno else "",
+                            lateral_desplegable={True: "sí", False: "no"}.get(desplegable, ""),
                             confianza=d.get("confianza", ""), explicacion=d.get("explicacion", ""))
             else:
                 fila["explicacion"] = f"ERROR: {r.result.type}"
             filas.append(fila)
+    if estado.get("revision"):
+        anterior = DATA / "flota_campanas_anterior.csv"
+        with anterior.open(encoding="utf-8-sig") as fh:
+            base = {r["campana"]: r for r in csv.DictReader(fh)}
+        cambios = Counter()
+        for f in filas:
+            antes = base.get(f["campana"], {}).get("vehiculos", "")
+            cambios[f"{antes or '—'} → {f['vehiculos'] or (f['tipo_si_no_flota'] or 'ninguno')}"] += 1
+            base[f["campana"]] = f
+        print("Cambios de la revisión: " + ", ".join(f"{k}: {n}" for k, n in cambios.most_common()))
+        filas = [{**{k: "" for k in filas[0]}, **r} for r in base.values()]
     filas.sort(key=lambda f: f["campana"])
     with FLOTA_CSV.open("w", newline="", encoding="utf-8-sig") as fh:
         w = csv.DictWriter(fh, fieldnames=list(filas[0]))
@@ -942,9 +987,11 @@ def cmd_flota_recoger(_args):
         w.writeheader()
         for f in res:
             c = por_campana.get(f.get("campana") or campana_de(f["carpetas"].split(" | ")[0]), {})
-            veh = c.get("vehiculos") or ("ninguno de la flota" if c.get("ninguno_de_la_flota") == "sí" else "")
+            veh = c.get("vehiculos") or (
+                f"{c['tipo_si_no_flota']} (no de la flota actual)" if c.get("tipo_si_no_flota")
+                else "ninguno de la flota" if c.get("ninguno_de_la_flota") == "sí" else "")
             w.writerow({**f, "vehiculo_campana": veh, "confianza_vehiculo_campana": c.get("confianza", "")})
-    cuenta = Counter(v.strip() for f in filas for v in (f["vehiculos"] or "").split(",") if v.strip())
+    cuenta = Counter(v for f in filas for v in vehiculos_de(f["vehiculos"]))
     print(f"\nFlota por campaña: {FLOTA_CSV} ({len(filas)} campañas, coste ≈ {coste:.2f} $)")
     print("  " + ", ".join(f"{k} {n}" for k, n in cuenta.most_common()) +
           f" · ninguno de la flota: {sum(f['ninguno_de_la_flota'] == 'sí' for f in filas)}")
@@ -952,6 +999,15 @@ def cmd_flota_recoger(_args):
 
 
 # ---------------------------------------------------------------- índice para el buscador del conector
+def vehiculo_foto(f):
+    """La etiqueta de flota de una foto (Haiku) solo se mantiene si su campaña no la contradice."""
+    v = f.get("vehiculo", "")
+    camp = f.get("vehiculo_campana")
+    if v in FLOTA and camp is not None and camp != "" and v not in vehiculos_de(camp):
+        return "otro vehículo"
+    return v
+
+
 def cmd_indice(args):
     """Junta los resultados de varias tandas en un indice.json para la herramienta buscar_fotos."""
     tandas = [Path(x.strip()) for x in (args.tandas or str(DATA)).split(",") if x.strip()]
@@ -978,7 +1034,7 @@ def cmd_indice(args):
                 "id": fid, "nombre": f["nombre"], "carpetas": f["carpetas"], "campana": camp,
                 "cliente": f.get("cliente_carpeta") or cliente_de(f["carpetas"].split(" | ")[0]),
                 "anio": int(anio) if anio else None,
-                "vehiculo": f.get("vehiculo", ""), "vehiculo_campana": f.get("vehiculo_campana", ""),
+                "vehiculo": vehiculo_foto(f), "vehiculo_campana": f.get("vehiculo_campana", ""),
                 "conf_vehiculo_campana": f.get("confianza_vehiculo_campana", ""),
                 "tipo_vehiculo": f.get("tipo_vehiculo", ""), "plano": f.get("plano", ""),
                 "lineas": [x.strip() for x in (f.get("lineas_servicio") or f.get("linea_servicio") or "").split(",") if x.strip()],
@@ -1029,6 +1085,8 @@ def main():
     p.add_argument("--si", action="store_true", help="no pedir confirmación antes de enviar")
     p.add_argument("--forzar", action="store_true", help="sustituir el lote de los modelos indicados")
     p.add_argument("--modelos", help="modelos a enviar, separados por comas (por defecto, MODELOS)")
+    p.add_argument("--revisar", help="con flota: vuelve a consultar solo las campañas asignadas a este "
+                                     "vehículo (p. ej. 13,80) y fusiona el resultado")
     p.add_argument("--tandas", help="con indice: carpetas de resultados separadas por comas "
                                     "(p. ej. /app/datos/archivo,/app/datos)")
     p.add_argument("--solo-incompletas", action="store_true",

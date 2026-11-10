@@ -79,6 +79,7 @@ Con el mismo `export` de la tanda:
 ```bash
 python etiquetar.py flota           # 3 fotos por campaña, pide confirmación, espera y recoge
 python etiquetar.py flota-recoger   # si cerraste antes de que terminara
+python etiquetar.py flota --revisar 13,80   # vuelve a consultar solo las campañas de ese vehículo y fusiona
 ```
 Genera `flota_campanas.csv` (una fila por campaña, con columnas para confirmar) y
 `resultados_flota.csv` (cada foto con el vehículo de su campaña).
