@@ -32,6 +32,10 @@ const CFG = {
   indiceUser: env.INDICE_USUARIO,
   indicePassword: env.INDICE_PASSWORD,
   indiceRefrescoMin: Number(env.INDICE_REFRESCO_MIN || 60),
+  // Índice de dossieres comerciales (lo genera el servicio box-dossieres: indice_dossieres.json)
+  dossieresUrl: env.INDICE_DOSSIERES_URL,
+  dossieresUser: env.INDICE_DOSSIERES_USUARIO,
+  dossieresPassword: env.INDICE_DOSSIERES_PASSWORD,
   apiBase: env.BOX_API_BASE || "https://api.box.com/2.0",
   uploadBase: env.BOX_UPLOAD_BASE || "https://upload.box.com/api/2.0",
   tokenUrl: env.BOX_TOKEN_URL || "https://api.box.com/oauth2/token",
@@ -270,6 +274,36 @@ function puntuar(f, terminos) {
     total += p;
   }
   return { total, encontrados };
+}
+
+// ---------------------------------------------------------------------------
+// Índice de dossieres comerciales (buscar_dossieres)
+// ---------------------------------------------------------------------------
+let dossieres = { lista: [], generado: null, cargadoEn: null, error: null };
+
+async function cargarDossieres() {
+  if (!CFG.dossieresUrl) return;
+  try {
+    const headers = {};
+    if (CFG.dossieresUser)
+      headers.Authorization =
+        "Basic " + Buffer.from(`${CFG.dossieresUser}:${CFG.dossieresPassword || ""}`).toString("base64");
+    const res = await fetch(CFG.dossieresUrl, { headers, signal: AbortSignal.timeout(60_000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const lista = (data.dossieres || []).map((d) => ({
+      ...d,
+      _anio: Number(String(d.anio || "").match(/(19|20)\d{2}/)?.[0]) || Number(String(d.fecha || "").slice(0, 4)) || null,
+      _alto: new Set(palabras([d.titulo, d.cliente, d.campana, d.palabras_clave].join(" "))),
+      _medio: new Set(palabras([d.tematicas, d.formato, d.vehiculos, d.publico, d.resumen].join(" "))),
+      _bajo: new Set(palabras((d.archivos || []).map((a) => `${a.nombre} ${a.carpeta || ""}`).join(" "))),
+    }));
+    dossieres = { lista, generado: data.generado || null, cargadoEn: new Date().toISOString(), error: null };
+    console.log(`Índice de dossieres cargado: ${lista.length} dossieres (generado ${dossieres.generado})`);
+  } catch (e) {
+    dossieres.error = e.message;
+    console.error("[dossieres] no se pudo cargar:", e.message, dossieres.lista.length ? "(sigo con el anterior)" : "");
+  }
 }
 
 const contar = (lista, clave) => {
@@ -562,6 +596,96 @@ function buildServer() {
     })
   );
 
+  server.registerTool(
+    "buscar_dossieres",
+    {
+      title: "Buscar dossieres comerciales",
+      description:
+        "Busca en el índice de dossieres comerciales de alegria-activity (unos 1.100 PDF de 2016 a hoy, en Box, " +
+        "fichados automáticamente: cliente, campaña, vehículos, formato, temáticas, público y resumen). Combina " +
+        "palabras clave con filtros. Busca por palabras: si no sale nada, prueba sinónimos, el sector en vez del " +
+        "cliente o términos más generales. Con orden 'recientes' y sin texto devuelve lo último de todo el archivo. " +
+        "Cada dossier trae el id de Box de la versión recomendada para descargar (usa box_get_download_link) y sus " +
+        "otras versiones o idiomas. 'fecha' es la última modificación en Box: algunas son de traslados en bloque y " +
+        "son aproximadas; si el dossier dice el año, viene en 'anio'.",
+      inputSchema: {
+        texto: z.string().optional().describe("Palabras clave, p. ej. 'salud mental Airstream', 'bibliobús', 'oficina bancaria móvil'"),
+        cliente: z.string().optional().describe("Filtra por cliente (texto parcial)"),
+        idioma: z.string().optional().describe("castellano, inglés, francés, polaco, euskera…"),
+        anio_desde: z.number().int().optional(),
+        anio_hasta: z.number().int().optional(),
+        orden: z.enum(["relevancia", "recientes"]).default("relevancia").describe("recientes: los más nuevos primero"),
+        limit: z.number().int().min(1).max(20).default(8),
+        offset: z.number().int().min(0).default(0),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    safe(async (a) => {
+      if (!CFG.dossieresUrl) return fail("El buscador de dossieres no está configurado (falta INDICE_DOSSIERES_URL).");
+      if (!dossieres.lista.length) {
+        await cargarDossieres();
+        if (!dossieres.lista.length)
+          return fail(`El índice de dossieres no está disponible${dossieres.error ? `: ${dossieres.error}` : ""}.`);
+      }
+      const nc = a.cliente ? norm(a.cliente) : null;
+      const ni = a.idioma ? norm(a.idioma).slice(0, 4) : null;
+      const base = dossieres.lista.filter((d) => {
+        if (nc && !norm(`${d.cliente} ${d.campana} ${d.titulo}`).includes(nc)) return false;
+        if (ni && !norm(d.idiomas).includes(ni)) return false;
+        if (a.anio_desde && !(d._anio >= a.anio_desde)) return false;
+        if (a.anio_hasta && !(d._anio <= a.anio_hasta)) return false;
+        return true;
+      });
+      const recientes = (x, y) => (y._anio || 0) - (x._anio || 0) || String(y.fecha).localeCompare(String(x.fecha));
+      const terminos = palabras(a.texto);
+      let lista = base;
+      if (terminos.length) {
+        const minimo = Math.max(1, Math.ceil(terminos.length / 2));
+        const puntuados = base.map((d) => ({ d, ...puntuar(d, terminos) })).filter((x) => x.encontrados >= minimo);
+        puntuados.sort((x, y) =>
+          a.orden === "recientes"
+            ? recientes(x.d, y.d) || y.total - x.total
+            : y.encontrados - x.encontrados || y.total - x.total || recientes(x.d, y.d)
+        );
+        lista = puntuados.map((x) => x.d);
+      } else {
+        lista = [...base].sort(recientes);
+      }
+      const pagina = lista.slice(a.offset, a.offset + a.limit).map((d) => {
+        const archivos = d.archivos || [];
+        const principal = archivos.find((x) => x.por_defecto) || archivos[0] || {};
+        return {
+          titulo: d.titulo,
+          cliente: d.cliente,
+          campana: d.campana,
+          anio: d.anio || null,
+          fecha: d.fecha,
+          idiomas: d.idiomas,
+          vehiculos: d.vehiculos,
+          formato: d.formato,
+          tematicas: d.tematicas,
+          publico: d.publico,
+          resumen: d.resumen,
+          descargar: { id: principal.id, nombre: principal.nombre, mb: principal.mb, enlace: `https://app.box.com/file/${principal.id}` },
+          otras_versiones: archivos
+            .filter((x) => x.id !== principal.id)
+            .map((x) => ({ id: x.id, nombre: x.nombre, idioma: x.idioma, modificado: x.modificado })),
+        };
+      });
+      return ok({
+        total: lista.length,
+        offset: a.offset,
+        mostrando: pagina.length,
+        resumen: {
+          por_cliente: contar(lista, (d) => d.cliente),
+          por_anio: contar(lista, (d) => (d._anio ? String(d._anio) : null)),
+        },
+        indice: { dossieres: dossieres.lista.length, generado: dossieres.generado },
+        dossieres: pagina,
+      });
+    })
+  );
+
   if (CFG.enableWrite) {
     const RW = { readOnlyHint: false, destructiveHint: false, openWorldHint: true };
 
@@ -659,6 +783,9 @@ app.get(["/health/box/:key", "/health/box"], async (req, res) => {
       indice_fotos: CFG.indiceUrl
         ? { fotos: indice.fotos.length, generado: indice.generado, cargado_en: indice.cargadoEn, error: indice.error }
         : "no configurado",
+      indice_dossieres: CFG.dossieresUrl
+        ? { dossieres: dossieres.lista.length, generado: dossieres.generado, cargado_en: dossieres.cargadoEn, error: dossieres.error }
+        : "no configurado",
     });
   } catch (e) {
     res.status(502).json({ ok: false, error: e.message });
@@ -696,6 +823,10 @@ checkConfig();
 if (CFG.indiceUrl) {
   cargarIndice();
   setInterval(cargarIndice, Math.max(5, CFG.indiceRefrescoMin) * 60_000).unref();
+}
+if (CFG.dossieresUrl) {
+  cargarDossieres();
+  setInterval(cargarDossieres, Math.max(5, CFG.indiceRefrescoMin) * 60_000).unref();
 }
 app.listen(CFG.port, "0.0.0.0", () => {
   console.log(
