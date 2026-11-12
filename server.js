@@ -392,6 +392,25 @@ function buscarCatalogos(consulta = "", idioma = null) {
   return salida;
 }
 
+// Una línea por catálogo para la descripción de la herramienta (como el system prompt del bot): así Claude sabe
+// qué existe y reconoce los nombres propios ("el Piti", "el Juncal") sin buscar antes.
+function resumenCatalogos() {
+  const lineas = [];
+  for (const c of catalogos.lista) {
+    const eds = [...(c.ediciones || [])].filter((e) => (e.archivos || []).length).sort((x, y) => anioEdicion(y) - anioEdicion(x));
+    if (!eds.length) continue;
+    if (c.solo_si_lo_piden) {
+      lineas.push(`${c.titulo} (solo si lo piden por su nombre)`);
+      continue;
+    }
+    const nombres = eds
+      .filter((e) => e.nombre)
+      .map((e) => `${e.edicion} ${e.nombre}${(e.alias || []).length ? ` (también ${e.alias.join(", ")})` : ""}`);
+    lineas.push(nombres.length ? `${c.titulo}: ${nombres.join(", ")}` : `${c.titulo} (última edición ${eds[0].edicion})`);
+  }
+  return lineas.length ? " Catálogos que hay ahora: " + lineas.join("; ") + "." : "";
+}
+
 const contar = (lista, clave) => {
   const c = new Map();
   for (const f of lista) for (const v of [].concat(clave(f) || [])) if (v) c.set(v, (c.get(v) || 0) + 1);
@@ -784,7 +803,9 @@ function buildServer() {
         "archivos por idioma y formato (baja = para correo, pantalla, pliegos = imprenta, alta) con su id de Box y " +
         "enlace. Si 'elegir_edicion' es true (el magazine), no des solo la última: enseña las ediciones por su nombre. " +
         "Si una edición tiene 'tambien_llamado', llámala siempre por su 'nombre'. 'solo_si_lo_piden': ofrécelo solo " +
-        "si lo nombran. Para descargar usa box_get_download_link con el id.",
+        "si lo nombran. Para descargar usa box_get_download_link con el id. Úsala también cuando nombren una " +
+        "edición por su nombre propio, aunque no digan 'catálogo' ni 'magazine'." +
+        resumenCatalogos(),
       inputSchema: {
         consulta: z.string().optional().describe("Tema o nombre, p. ej. 'sanidad', 'magazine', 'Lucas', 'presentación'. Vacío = todos"),
         idioma: z.string().optional().describe("castellano, inglés, francés, polaco…"),
