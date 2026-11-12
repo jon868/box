@@ -3,6 +3,12 @@
 // Todos los usuarios de Claude comparten el mismo acceso a Box: el de la cuenta de
 // servicio de la app. Nadie inicia sesión en Box; el servidor obtiene y renueva el token
 // por su cuenta. El acceso al servidor se protege con MCP_SECRET.
+//
+// Miniaturas (opcional): con PUBLIC_BASE_URL (URL pública de este servicio, p. ej.
+// https://tools-box-mcp.3te3kb.easypanel.host) las herramientas devuelven enlaces firmados
+// /thumb/<320|1024>/<id>.jpg?s=<firma> que cualquier chat puede incrustar como imagen Markdown.
+// La firma usa THUMB_SECRET (o, si no se define, una clave derivada de MCP_SECRET): solo
+// funcionan los enlaces que ha generado el propio servidor. Cambiar el secreto invalida todos.
 
 import express from "express";
 import crypto from "node:crypto";
@@ -46,6 +52,10 @@ const CFG = {
   apiBase: env.BOX_API_BASE || "https://api.box.com/2.0",
   uploadBase: env.BOX_UPLOAD_BASE || "https://upload.box.com/api/2.0",
   tokenUrl: env.BOX_TOKEN_URL || "https://api.box.com/oauth2/token",
+  // Miniaturas públicas firmadas
+  publicBaseUrl: (env.PUBLIC_BASE_URL || "").trim().replace(/\/+$/, ""),
+  thumbSecret: env.THUMB_SECRET,
+  thumbCacheMb: Number(env.THUMB_CACHE_MB || 64),
 };
 
 function checkConfig() {
@@ -56,6 +66,10 @@ function checkConfig() {
   if (!CFG.mcpSecret && !CFG.allowNoAuth) missing.push("MCP_SECRET");
   if (CFG.mcpSecret && CFG.mcpSecret.length < 24)
     missing.push("MCP_SECRET (mínimo 24 caracteres)");
+  if (CFG.thumbSecret && CFG.thumbSecret.length < 24)
+    missing.push("THUMB_SECRET (mínimo 24 caracteres)");
+  if (CFG.publicBaseUrl && !/^https?:\/\//.test(CFG.publicBaseUrl))
+    missing.push("PUBLIC_BASE_URL (debe empezar por https://)");
   if (missing.length) {
     console.error(`Faltan variables de entorno: ${missing.join(", ")}`);
     process.exit(1);
@@ -223,6 +237,84 @@ async function downloadFile(fileId) {
   const res = await box(`/files/${encodeURIComponent(fileId)}/content`, { raw: true });
   if (!res.ok) throw new BoxError(res.status, `Error descargando el archivo (${res.status})`);
   return res;
+}
+
+// ---------------------------------------------------------------------------
+// Miniaturas públicas firmadas (/thumb)
+// Para que un cliente de chat (Open WebUI, el bot…) pueda mostrar la foto con
+// Markdown sin que el modelo tenga que recibir la imagen.
+// ---------------------------------------------------------------------------
+const THUMB_SIZES = new Set(["320", "1024"]);
+const thumbKey = CFG.thumbSecret
+  ? Buffer.from(CFG.thumbSecret)
+  : CFG.mcpSecret
+    ? crypto.createHmac("sha256", CFG.mcpSecret).update("box-alegria-miniaturas").digest()
+    : null;
+const miniaturasActivas = Boolean(CFG.publicBaseUrl && thumbKey);
+
+const firmaMiniatura = (fileId, size) =>
+  crypto.createHmac("sha256", thumbKey).update(`${fileId}:${size}`).digest("base64url").slice(0, 32);
+
+function urlMiniatura(fileId, size = "320") {
+  if (!miniaturasActivas) return undefined;
+  const id = String(fileId);
+  return `${CFG.publicBaseUrl}/thumb/${size}/${encodeURIComponent(id)}.jpg?s=${firmaMiniatura(id, size)}`;
+}
+
+const extensionDe = (it) => String(it?.extension || String(it?.name || "").split(".").pop() || "").toLowerCase();
+const esImagen = (it) => it?.type === "file" && IMAGE_EXT.has(extensionDe(it));
+
+// Versión de slim() que añade la miniatura cuando el archivo es una imagen
+const slimConMiniatura = (it) => {
+  const s = slim(it);
+  if (miniaturasActivas && esImagen(it)) s.miniatura = urlMiniatura(it.id, "320");
+  return s;
+};
+
+// Caché LRU en memoria (por bytes) y deduplicación de peticiones simultáneas
+const cacheMiniaturas = new Map();
+const miniaturasEnCurso = new Map();
+let bytesCacheMiniaturas = 0;
+const MAX_CACHE_MINIATURAS = Math.max(8, CFG.thumbCacheMb) * 1024 * 1024;
+
+function guardarMiniatura(clave, buf) {
+  if (buf.length > MAX_CACHE_MINIATURAS / 4) return;
+  if (cacheMiniaturas.has(clave)) {
+    bytesCacheMiniaturas -= cacheMiniaturas.get(clave).length;
+    cacheMiniaturas.delete(clave);
+  }
+  cacheMiniaturas.set(clave, buf);
+  bytesCacheMiniaturas += buf.length;
+  while (bytesCacheMiniaturas > MAX_CACHE_MINIATURAS) {
+    const [k, b] = cacheMiniaturas.entries().next().value;
+    cacheMiniaturas.delete(k);
+    bytesCacheMiniaturas -= b.length;
+  }
+}
+
+async function obtenerMiniatura(fileId, size) {
+  const clave = `${size}:${fileId}`;
+  const enCache = cacheMiniaturas.get(clave);
+  if (enCache) {
+    // marcar como usada recientemente
+    cacheMiniaturas.delete(clave);
+    cacheMiniaturas.set(clave, enCache);
+    return enCache;
+  }
+  if (!miniaturasEnCurso.has(clave)) {
+    miniaturasEnCurso.set(
+      clave,
+      (async () => {
+        await getItem("file", fileId); // respeta BOX_ALLOWED_FOLDER_IDS
+        const res = await getRepresentation(fileId, `[jpg?dimensions=${size}x${size}]`);
+        if (!res) throw new BoxError(404, "Box no ofrece vista previa de este archivo");
+        const buf = Buffer.from(await res.arrayBuffer());
+        guardarMiniatura(clave, buf);
+        return buf;
+      })().finally(() => miniaturasEnCurso.delete(clave))
+    );
+  }
+  return miniaturasEnCurso.get(clave);
 }
 
 // ---------------------------------------------------------------------------
@@ -461,7 +553,7 @@ function buildServer() {
         folder: { id: folder_id, path: pathOf(folder) },
         total_count: data.total_count,
         offset,
-        items: data.entries.map(slim),
+        items: data.entries.map(slimConMiniatura),
       });
     })
   );
@@ -504,7 +596,7 @@ function buildServer() {
           fields: "id,type,name,size,modified_at,path_collection,extension",
         },
       });
-      return ok({ total_count: data.total_count, offset, items: data.entries.filter(isAllowed).map(slim) });
+      return ok({ total_count: data.total_count, offset, items: data.entries.filter(isAllowed).map(slimConMiniatura) });
     })
   );
 
@@ -566,7 +658,13 @@ function buildServer() {
     {
       title: "Ver una imagen",
       description:
-        "Devuelve una imagen de Box para que Claude la vea (JPG/PNG/HEIC/PSD/PDF… convertida por Box a JPG). Para el archivo original a máxima calidad usa box_get_download_link.",
+        "Devuelve una imagen de Box para que Claude la vea (JPG/PNG/HEIC/PSD/PDF… convertida por Box a JPG). " +
+        "Úsala cuando tú necesites ver la foto para comprobar o describir algo. " +
+        (miniaturasActivas
+          ? "Para ENSEÑÁRSELA al usuario no hace falta: incrusta su 'miniatura' en Markdown, ![nombre](miniatura), " +
+            "que algunos clientes de chat no muestran las imágenes devueltas por herramientas. "
+          : "") +
+        "Para el archivo original a máxima calidad usa box_get_download_link.",
       inputSchema: {
         file_id: z.string(),
         size: z.enum(["320", "1024", "2048"]).default("1024").describe("Lado máximo en píxeles"),
@@ -578,9 +676,12 @@ function buildServer() {
       const res = await getRepresentation(file_id, `[jpg?dimensions=${size}x${size}]`);
       if (!res) return fail(`Box no puede generar una vista previa de «${f.name}».`);
       const buf = Buffer.from(await res.arrayBuffer());
+      const mostrar = miniaturasActivas
+        ? `\nPara mostrarla al usuario: ![${f.name.replace(/[[\]]/g, "")}](${urlMiniatura(f.id, size === "320" ? "320" : "1024")})`
+        : "";
       return {
         content: [
-          { type: "text", text: `${pathOf(f)} (id ${f.id})` },
+          { type: "text", text: `${pathOf(f)} (id ${f.id})${mostrar}` },
           { type: "image", data: buf.toString("base64"), mimeType: "image/jpeg" },
         ],
       };
@@ -612,8 +713,13 @@ function buildServer() {
       description:
         "Busca en el índice de fotos etiquetadas del archivo de alegria-activity (fotos de campañas en Box, " +
         "descritas automáticamente). Combina texto libre (descripción, palabras clave, marca, cliente) con filtros. " +
-        "Por defecto excluye fotos con posibles menores y fotos no aptas para propuesta. Devuelve el id de Box de cada " +
-        "foto: para enseñarla usa box_get_image. Las etiquetas son automáticas: confirma con la imagen antes de afirmar algo.",
+        "Por defecto excluye fotos con posibles menores y fotos no aptas para propuesta. " +
+        (miniaturasActivas
+          ? "Cada foto trae 'miniatura' (320 px) e 'imagen_grande' (1024 px): para ENSEÑARLA al usuario incrústala en " +
+            "Markdown, ![nombre](miniatura), sin llamar a box_get_image (así se ve en cualquier chat y no gasta tokens). " +
+            "Usa box_get_image solo si tú necesitas ver la foto para comprobar algo. "
+          : "Devuelve el id de Box de cada foto: para enseñarla usa box_get_image. ") +
+        "Las etiquetas son automáticas: no afirmes como seguro lo que no hayas comprobado en la imagen.",
       inputSchema: {
         texto: z.string().optional().describe("Palabras a buscar, p. ej. 'pantallas interior realidad virtual'"),
         vehiculo: z.enum(FLOTA).optional().describe("Vehículo de la flota (en la foto o asignado a su campaña)"),
@@ -684,6 +790,7 @@ function buildServer() {
         menores: f.menores,
         uso: f.uso,
         enlace: `https://app.box.com/file/${f.id}`,
+        ...(miniaturasActivas && { miniatura: urlMiniatura(f.id, "320"), imagen_grande: urlMiniatura(f.id, "1024") }),
       }));
       return ok({
         total: lista.length,
@@ -932,6 +1039,14 @@ app.get(["/health/box/:key", "/health/box"], async (req, res) => {
       indice_catalogos: CFG.catalogosUrl
         ? { catalogos: catalogos.lista.length, generado: catalogos.generado, cargado_en: catalogos.cargadoEn, error: catalogos.error }
         : "no configurado",
+      miniaturas: miniaturasActivas
+        ? {
+            base: CFG.publicBaseUrl,
+            secreto: CFG.thumbSecret ? "THUMB_SECRET" : "derivado de MCP_SECRET",
+            en_cache: cacheMiniaturas.size,
+            cache_mb: Math.round((bytesCacheMiniaturas / 1024 / 1024) * 10) / 10,
+          }
+        : "desactivadas (falta PUBLIC_BASE_URL)",
     });
   } catch (e) {
     res.status(502).json({ ok: false, error: e.message });
@@ -965,6 +1080,29 @@ async function handleMcp(req, res) {
 
 app.all(["/mcp/:key", "/mcp"], handleMcp);
 
+// Miniatura pública firmada: /thumb/<320|1024>/<file_id>.jpg?s=<firma>
+// Sin MCP_SECRET a propósito: la firma solo vale para ese archivo y ese tamaño.
+app.get("/thumb/:size/:file", async (req, res) => {
+  const { size } = req.params;
+  const fileId = String(req.params.file).replace(/\.jpe?g$/i, "");
+  if (!miniaturasActivas || !THUMB_SIZES.has(size) || !/^\d{1,20}$/.test(fileId)) return res.status(404).end();
+  const dada = Buffer.from(String(req.query.s || ""));
+  const buena = Buffer.from(firmaMiniatura(fileId, size));
+  if (dada.length !== buena.length || !crypto.timingSafeEqual(dada, buena)) return res.status(403).end();
+  try {
+    const buf = await obtenerMiniatura(fileId, size);
+    res.set({
+      "Content-Type": "image/jpeg",
+      "Cache-Control": "public, max-age=604800, immutable",
+      "X-Content-Type-Options": "nosniff",
+    });
+    res.send(buf);
+  } catch (e) {
+    console.error("[miniatura]", fileId, size, e.message);
+    res.status([403, 404, 422].includes(e.status) ? (e.status === 422 ? 404 : e.status) : 502).end();
+  }
+});
+
 checkConfig();
 if (CFG.indiceUrl) {
   cargarIndice();
@@ -981,6 +1119,7 @@ if (CFG.catalogosUrl) {
 app.listen(CFG.port, "0.0.0.0", () => {
   console.log(
     `Box_alegria MCP escuchando en :${CFG.port} — escritura ${CFG.enableWrite ? "ACTIVADA" : "desactivada"}` +
-      (CFG.allowedFolders.length ? `, carpetas permitidas: ${CFG.allowedFolders.join(", ")}` : ", sin restricción de carpetas")
+      (CFG.allowedFolders.length ? `, carpetas permitidas: ${CFG.allowedFolders.join(", ")}` : ", sin restricción de carpetas") +
+      (miniaturasActivas ? `, miniaturas en ${CFG.publicBaseUrl}/thumb` : ", miniaturas desactivadas (falta PUBLIC_BASE_URL)")
   );
 });
