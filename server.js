@@ -5,8 +5,10 @@
 // por su cuenta. El acceso al servidor se protege con MCP_SECRET.
 //
 // Miniaturas (opcional): con PUBLIC_BASE_URL (URL pública de este servicio, p. ej.
-// https://tools-box-mcp.3te3kb.easypanel.host) las herramientas devuelven enlaces firmados
-// /thumb/<320|1024>/<id>.jpg?s=<firma> que cualquier chat puede incrustar como imagen Markdown.
+// https://tools-box-mcp.3te3kb.easypanel.host), las conexiones que añadan ?miniaturas=1 a la URL
+// (/mcp/<secreto>?miniaturas=1, p. ej. Open WebUI) reciben enlaces firmados
+// /thumb/<320|1024>/<id>.jpg?s=<firma> para incrustar la foto como imagen Markdown. Las conexiones
+// sin ese parámetro (claude.ai) no cambian.
 // La firma usa THUMB_SECRET (o, si no se define, una clave derivada de MCP_SECRET): solo
 // funcionan los enlaces que ha generado el propio servidor. Cambiar el secreto invalida todos.
 
@@ -523,8 +525,12 @@ const safe = (fn) => async (args) => {
   }
 };
 
-function buildServer() {
+// conMiniaturas: solo para clientes que muestran imágenes Markdown externas (Open WebUI…), pedido con
+// ?miniaturas=1 en la URL del conector. claude.ai no las carga, así que allí todo sigue como antes.
+function buildServer({ conMiniaturas = false } = {}) {
   const server = new McpServer({ name: "Box_alegria", version: "2.0.0" });
+  const M = miniaturasActivas && conMiniaturas;
+  const lista = (it) => (M ? slimConMiniatura(it) : slim(it));
   const RO = { readOnlyHint: true, openWorldHint: true };
 
   server.registerTool(
@@ -553,7 +559,7 @@ function buildServer() {
         folder: { id: folder_id, path: pathOf(folder) },
         total_count: data.total_count,
         offset,
-        items: data.entries.map(slimConMiniatura),
+        items: data.entries.map(lista),
       });
     })
   );
@@ -596,7 +602,7 @@ function buildServer() {
           fields: "id,type,name,size,modified_at,path_collection,extension",
         },
       });
-      return ok({ total_count: data.total_count, offset, items: data.entries.filter(isAllowed).map(slimConMiniatura) });
+      return ok({ total_count: data.total_count, offset, items: data.entries.filter(isAllowed).map(lista) });
     })
   );
 
@@ -660,7 +666,7 @@ function buildServer() {
       description:
         "Devuelve una imagen de Box para que Claude la vea (JPG/PNG/HEIC/PSD/PDF… convertida por Box a JPG). " +
         "Úsala cuando tú necesites ver la foto para comprobar o describir algo. " +
-        (miniaturasActivas
+        (M
           ? "Para ENSEÑÁRSELA al usuario no hace falta: incrusta su 'miniatura' en Markdown, ![nombre](miniatura), " +
             "que algunos clientes de chat no muestran las imágenes devueltas por herramientas. "
           : "") +
@@ -676,7 +682,7 @@ function buildServer() {
       const res = await getRepresentation(file_id, `[jpg?dimensions=${size}x${size}]`);
       if (!res) return fail(`Box no puede generar una vista previa de «${f.name}».`);
       const buf = Buffer.from(await res.arrayBuffer());
-      const mostrar = miniaturasActivas
+      const mostrar = M
         ? `\nPara mostrarla al usuario: ![${f.name.replace(/[[\]]/g, "")}](${urlMiniatura(f.id, size === "320" ? "320" : "1024")})`
         : "";
       return {
@@ -714,7 +720,7 @@ function buildServer() {
         "Busca en el índice de fotos etiquetadas del archivo de alegria-activity (fotos de campañas en Box, " +
         "descritas automáticamente). Combina texto libre (descripción, palabras clave, marca, cliente) con filtros. " +
         "Por defecto excluye fotos con posibles menores y fotos no aptas para propuesta. " +
-        (miniaturasActivas
+        (M
           ? "Cada foto trae 'miniatura' (320 px) e 'imagen_grande' (1024 px): para ENSEÑARLA al usuario incrústala en " +
             "Markdown, ![nombre](miniatura), sin llamar a box_get_image (así se ve en cualquier chat y no gasta tokens). " +
             "Usa box_get_image solo si tú necesitas ver la foto para comprobar algo. "
@@ -790,7 +796,7 @@ function buildServer() {
         menores: f.menores,
         uso: f.uso,
         enlace: `https://app.box.com/file/${f.id}`,
-        ...(miniaturasActivas && { miniatura: urlMiniatura(f.id, "320"), imagen_grande: urlMiniatura(f.id, "1024") }),
+        ...(M && { miniatura: urlMiniatura(f.id, "320"), imagen_grande: urlMiniatura(f.id, "1024") }),
       }));
       return ok({
         total: lista.length,
@@ -1062,7 +1068,8 @@ async function handleMcp(req, res) {
     // Modo sin estado: no hay stream GET ni sesiones que cerrar
     return res.status(405).set("Allow", "POST").json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed" }, id: null });
   }
-  const server = buildServer();
+  const flag = String(req.query.miniaturas || "").toLowerCase();
+  const server = buildServer({ conMiniaturas: ["1", "true", "si", "sí"].includes(flag) });
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
   res.on("close", () => {
     transport.close();
