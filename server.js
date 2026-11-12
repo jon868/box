@@ -36,6 +36,13 @@ const CFG = {
   dossieresUrl: env.INDICE_DOSSIERES_URL,
   dossieresUser: env.INDICE_DOSSIERES_USUARIO,
   dossieresPassword: env.INDICE_DOSSIERES_PASSWORD,
+  // Catálogos, magazine y presentación corporativa (lo publica box-dossieres: indice_catalogos.json, el mismo
+  // catálogo que usa el bot). Si no se define, se usa la URL de dossieres cambiando el nombre del archivo.
+  catalogosUrl:
+    env.INDICE_CATALOGOS_URL ||
+    (env.INDICE_DOSSIERES_URL ? env.INDICE_DOSSIERES_URL.replace(/indice_dossieres\.json/, "indice_catalogos.json") : ""),
+  catalogosUser: env.INDICE_CATALOGOS_USUARIO || env.INDICE_DOSSIERES_USUARIO,
+  catalogosPassword: env.INDICE_CATALOGOS_PASSWORD || env.INDICE_DOSSIERES_PASSWORD,
   apiBase: env.BOX_API_BASE || "https://api.box.com/2.0",
   uploadBase: env.BOX_UPLOAD_BASE || "https://upload.box.com/api/2.0",
   tokenUrl: env.BOX_TOKEN_URL || "https://api.box.com/oauth2/token",
@@ -304,6 +311,85 @@ async function cargarDossieres() {
     dossieres.error = e.message;
     console.error("[dossieres] no se pudo cargar:", e.message, dossieres.lista.length ? "(sigo con el anterior)" : "");
   }
+}
+
+// ---------------------------------------------------------------------------
+// Catálogos, magazine y presentación corporativa (buscar_catalogos)
+// Misma lógica que catalogos.buscar() del bot de box-dossieres.
+// ---------------------------------------------------------------------------
+let catalogos = { lista: [], formatos: {}, generado: null, cargadoEn: null, error: null };
+
+async function cargarCatalogos() {
+  if (!CFG.catalogosUrl) return;
+  try {
+    const headers = {};
+    if (CFG.catalogosUser)
+      headers.Authorization =
+        "Basic " + Buffer.from(`${CFG.catalogosUser}:${CFG.catalogosPassword || ""}`).toString("base64");
+    const res = await fetch(CFG.catalogosUrl, { headers, signal: AbortSignal.timeout(60_000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    catalogos = {
+      lista: data.catalogos || [],
+      formatos: data.formatos || {},
+      generado: data.generado || null,
+      cargadoEn: new Date().toISOString(),
+      error: null,
+    };
+    console.log(`Índice de catálogos cargado: ${catalogos.lista.length} catálogos (generado ${catalogos.generado})`);
+  } catch (e) {
+    catalogos.error = e.message;
+    console.error("[catálogos] no se pudo cargar:", e.message, catalogos.lista.length ? "(sigo con el anterior)" : "");
+  }
+}
+
+const VACIAS_CAT = new Set(
+  ("a al algo algun alguna algunos ante con como contra cual de del desde donde dossier dossieres dosier dosieres el " +
+    "ella en entre era es esa ese esta este esto hay la las le lo los mas me mi muy nos o para pero por que quiero se " +
+    "sea si sin sobre su sus tenemos tiene todo tu un una uno unos y ya busco buscame dame hazme ejemplo ejemplos " +
+    "campana campanas hicimos hecho tengo tenga catalogo catalogos ultimo ultima version pasame manda").split(" ")
+);
+const anioEdicion = (e) => Number(String(e.edicion).match(/(19|20)\d{2}/)?.[0]) || 0;
+
+function buscarCatalogos(consulta = "", idioma = null) {
+  const q = norm(consulta).split(/\s+/).filter((p) => p.length >= 3 && !VACIAS_CAT.has(p));
+  const ni = idioma ? norm(idioma).slice(0, 4) : null;
+  const salida = [];
+  for (const c of catalogos.lista) {
+    const apodos = (c.ediciones || []).flatMap((e) => [e.nombre || "", ...(e.alias || [])]);
+    const texto = norm([c.id, c.titulo, c.tipo, c.describe || "", ...(c.palabras || []), ...apodos].join(" "));
+    if (q.length && !q.some((p) => texto.includes(p))) continue;
+    if (c.solo_si_lo_piden && !q.some((p) => norm((c.palabras || []).join(" ")).includes(p))) continue;
+    const eds = [];
+    for (const e of [...(c.ediciones || [])].filter((e) => (e.archivos || []).length).sort((x, y) => anioEdicion(y) - anioEdicion(x))) {
+      const archivos = e.archivos.filter((a) => !ni || norm(a.idioma).includes(ni));
+      if (archivos.length)
+        eds.push({
+          edicion: e.edicion,
+          nombre: e.nombre || "",
+          nota: e.nota || "",
+          tambien_llamado: e.alias || [],
+          archivos: archivos.map((a) => ({
+            id: a.id,
+            idioma: a.idioma || "sin confirmar",
+            formato: a.formato,
+            mb: a.mb,
+            enlace: `https://app.box.com/file/${a.id}`,
+          })),
+        });
+    }
+    if (eds.length)
+      salida.push({
+        catalogo: c.id,
+        titulo: c.titulo,
+        tipo: c.tipo,
+        describe: c.describe || "",
+        elegir_edicion: Boolean(c.elegir_edicion),
+        solo_si_lo_piden: Boolean(c.solo_si_lo_piden),
+        ediciones: eds,
+      });
+  }
+  return salida;
 }
 
 const contar = (lista, clave) => {
@@ -686,6 +772,42 @@ function buildServer() {
     })
   );
 
+  server.registerTool(
+    "buscar_catalogos",
+    {
+      title: "Buscar catálogos, magazine y presentación corporativa",
+      description:
+        "Busca en los catálogos genéricos de alegria-activity (Box: 00.COMPARTIDO / 1. Material Comercial): " +
+        "catálogos por sector (Sanidad, Construcción, Manufacturing, Set TV…), el magazine y la presentación " +
+        "corporativa. Es el mismo catálogo que usa el bot de Telegram y se actualiza solo cada noche. Sin consulta " +
+        "devuelve todos. Cada catálogo trae sus ediciones de la más nueva a la más antigua y, en cada edición, los " +
+        "archivos por idioma y formato (baja = para correo, pantalla, pliegos = imprenta, alta) con su id de Box y " +
+        "enlace. Si 'elegir_edicion' es true (el magazine), no des solo la última: enseña las ediciones por su nombre. " +
+        "Si una edición tiene 'tambien_llamado', llámala siempre por su 'nombre'. 'solo_si_lo_piden': ofrécelo solo " +
+        "si lo nombran. Para descargar usa box_get_download_link con el id.",
+      inputSchema: {
+        consulta: z.string().optional().describe("Tema o nombre, p. ej. 'sanidad', 'magazine', 'Lucas', 'presentación'. Vacío = todos"),
+        idioma: z.string().optional().describe("castellano, inglés, francés, polaco…"),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    safe(async (a) => {
+      if (!CFG.catalogosUrl) return fail("El buscador de catálogos no está configurado (falta INDICE_DOSSIERES_URL o INDICE_CATALOGOS_URL).");
+      if (!catalogos.lista.length) {
+        await cargarCatalogos();
+        if (!catalogos.lista.length)
+          return fail(`El índice de catálogos no está disponible${catalogos.error ? `: ${catalogos.error}` : ""}.`);
+      }
+      const cats = buscarCatalogos(a.consulta || "", a.idioma || null);
+      return ok({
+        total: cats.length,
+        formatos: catalogos.formatos,
+        indice: { catalogos: catalogos.lista.length, generado: catalogos.generado },
+        catalogos: cats,
+      });
+    })
+  );
+
   if (CFG.enableWrite) {
     const RW = { readOnlyHint: false, destructiveHint: false, openWorldHint: true };
 
@@ -786,6 +908,9 @@ app.get(["/health/box/:key", "/health/box"], async (req, res) => {
       indice_dossieres: CFG.dossieresUrl
         ? { dossieres: dossieres.lista.length, generado: dossieres.generado, cargado_en: dossieres.cargadoEn, error: dossieres.error }
         : "no configurado",
+      indice_catalogos: CFG.catalogosUrl
+        ? { catalogos: catalogos.lista.length, generado: catalogos.generado, cargado_en: catalogos.cargadoEn, error: catalogos.error }
+        : "no configurado",
     });
   } catch (e) {
     res.status(502).json({ ok: false, error: e.message });
@@ -827,6 +952,10 @@ if (CFG.indiceUrl) {
 if (CFG.dossieresUrl) {
   cargarDossieres();
   setInterval(cargarDossieres, Math.max(5, CFG.indiceRefrescoMin) * 60_000).unref();
+}
+if (CFG.catalogosUrl) {
+  cargarCatalogos();
+  setInterval(cargarCatalogos, Math.max(5, CFG.indiceRefrescoMin) * 60_000).unref();
 }
 app.listen(CFG.port, "0.0.0.0", () => {
   console.log(
