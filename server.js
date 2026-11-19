@@ -11,6 +11,9 @@
 // sin ese parámetro (claude.ai) no cambian.
 // La firma usa THUMB_SECRET (o, si no se define, una clave derivada de MCP_SECRET): solo
 // funcionan los enlaces que ha generado el propio servidor. Cambiar el secreto invalida todos.
+//
+// Niveles de acceso: MCP_SECRET da acceso completo. MCP_SECRET_LIMITADO (opcional) abre el mismo conector
+// con acceso limitado: buscar_oportunidades no devuelve importes, presupuestos ni documentos económicos.
 
 import express from "express";
 import crypto from "node:crypto";
@@ -29,6 +32,7 @@ const CFG = {
   enterpriseId: env.BOX_ENTERPRISE_ID, // actuar como la cuenta de servicio (recomendado)
   userId: env.BOX_USER_ID, // alternativa: actuar como un usuario concreto de Box
   mcpSecret: env.MCP_SECRET,
+  mcpSecretLimitado: env.MCP_SECRET_LIMITADO,
   allowNoAuth: env.ALLOW_NO_AUTH === "true",
   enableWrite: env.ENABLE_WRITE === "true",
   allowedFolders: (env.BOX_ALLOWED_FOLDER_IDS || "")
@@ -51,6 +55,10 @@ const CFG = {
     (env.INDICE_DOSSIERES_URL ? env.INDICE_DOSSIERES_URL.replace(/indice_dossieres\.json/, "indice_catalogos.json") : ""),
   catalogosUser: env.INDICE_CATALOGOS_USUARIO || env.INDICE_DOSSIERES_USUARIO,
   catalogosPassword: env.INDICE_CATALOGOS_PASSWORD || env.INDICE_DOSSIERES_PASSWORD,
+  // Índice de oportunidades (lo genera el servicio box-oportunidades: fichas/indice_oportunidades.json)
+  oportunidadesUrl: env.INDICE_OPORTUNIDADES_URL,
+  oportunidadesUser: env.INDICE_OPORTUNIDADES_USUARIO,
+  oportunidadesPassword: env.INDICE_OPORTUNIDADES_PASSWORD,
   apiBase: env.BOX_API_BASE || "https://api.box.com/2.0",
   uploadBase: env.BOX_UPLOAD_BASE || "https://upload.box.com/api/2.0",
   tokenUrl: env.BOX_TOKEN_URL || "https://api.box.com/oauth2/token",
@@ -68,6 +76,10 @@ function checkConfig() {
   if (!CFG.mcpSecret && !CFG.allowNoAuth) missing.push("MCP_SECRET");
   if (CFG.mcpSecret && CFG.mcpSecret.length < 24)
     missing.push("MCP_SECRET (mínimo 24 caracteres)");
+  if (CFG.mcpSecretLimitado && CFG.mcpSecretLimitado.length < 24)
+    missing.push("MCP_SECRET_LIMITADO (mínimo 24 caracteres)");
+  if (CFG.mcpSecretLimitado && CFG.mcpSecretLimitado === CFG.mcpSecret)
+    missing.push("MCP_SECRET_LIMITADO (debe ser distinto de MCP_SECRET)");
   if (CFG.thumbSecret && CFG.thumbSecret.length < 24)
     missing.push("THUMB_SECRET (mínimo 24 caracteres)");
   if (CFG.publicBaseUrl && !/^https?:\/\//.test(CFG.publicBaseUrl))
@@ -505,6 +517,130 @@ function resumenCatalogos() {
   return lineas.length ? " Catálogos que hay ahora: " + lineas.join("; ") + "." : "";
 }
 
+// ---------------------------------------------------------------------------
+// Índice de oportunidades (buscar_oportunidades): HubSpot + Box + fichas de Haiku
+// ---------------------------------------------------------------------------
+let oportunidades = { lista: [], generado: null, cargadoEn: null, error: null };
+const lst = (x) => (Array.isArray(x) ? x : x == null || x === "" ? [] : [x]).map((v) => (typeof v === "string" ? v : JSON.stringify(v)));
+const txt = (x) => (Array.isArray(x) ? x.join(" ") : x == null ? "" : typeof x === "string" ? x : JSON.stringify(x));
+const ECONOMICO_RE = /contrato|factura|presupuesto|ppto|oferta econ|tarifa|coste|pedido|albar|aval|tasa|pago|cotizaci/i;
+
+async function cargarOportunidades() {
+  if (!CFG.oportunidadesUrl) return;
+  try {
+    const headers = {};
+    if (CFG.oportunidadesUser)
+      headers.Authorization =
+        "Basic " + Buffer.from(`${CFG.oportunidadesUser}:${CFG.oportunidadesPassword || ""}`).toString("base64");
+    const res = await fetch(CFG.oportunidadesUrl, { headers, signal: AbortSignal.timeout(120_000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const lista = (data.oportunidades || []).map((o) => {
+      const p = o.propuesta || {};
+      const y = o.proyecto || {};
+      const m = o.mapa || {};
+      return {
+        ...o,
+        _anio: Number(o.anio) || Number(String(o.fecha_cierre || "").slice(0, 4)) || Number(p.anio) || null,
+        _grupo: (o.situacion || "").split(" ")[0],
+        _vehiculos: [p.vehiculo, y.vehiculo].filter(Boolean),
+        _alto: new Set(palabras([o.carpeta, o.cliente, o.negocio, p.titulo, p.cliente_final, p.agencia_intermediaria,
+          txt(p.palabras_clave), txt(y.palabras_clave)].join(" "))),
+        _medio: new Set(palabras([p.que_se_propuso, p.concepto_creativo, txt(p.formato), txt(p.tematicas), p.publico,
+          p.ambito_geografico, txt(p.elementos_experiencia), p.vehiculo, p.vehiculo_descripcion, y.resumen,
+          txt(y.recorrido), y.experiencia, y.vehiculo, y.vehiculo_descripcion, txt(y.resultados)].join(" "))),
+        _bajo: new Set(palabras([m.resumen_estructura, txt((m.secciones || []).map((s) => `${s.categoria} ${s.descripcion} ${txt(s.rutas)}`)),
+          txt((p.documentos || []).map((d) => `${d.tipo} ${d.descripcion || ""}`)), y.permisos_y_tramites,
+          txt(y.proveedores_y_socios), y.incidencias_y_aprendizajes, o.pais].join(" "))),
+      };
+    });
+    oportunidades = { lista, generado: data.generado || null, cargadoEn: new Date().toISOString(), error: null };
+    console.log(`Índice de oportunidades cargado: ${lista.length} oportunidades (generado ${oportunidades.generado})`);
+  } catch (e) {
+    oportunidades.error = e.message;
+    console.error("[oportunidades] no se pudo cargar:", e.message, oportunidades.lista.length ? "(sigo con el anterior)" : "");
+  }
+}
+
+// Ficha para la respuesta. nivel "limitado": sin importes, presupuestos ni documentos económicos.
+function fichaOportunidad(o, { detalle, limitado }) {
+  const p = o.propuesta || {};
+  const y = o.proyecto || {};
+  const m = o.mapa || {};
+  const enlace = (id) => (id ? `https://app.box.com/file/${id}` : undefined);
+  const docs = (lista) =>
+    (lista || [])
+      .filter((d) => d && d.id && !(limitado && ECONOMICO_RE.test(`${d.tipo} ${d.descripcion || ""}`)))
+      .map((d) => ({ tipo: d.tipo, descripcion: d.descripcion || d.motivo, id: d.id, enlace: enlace(d.id) }));
+  const out = {
+    oportunidad: o.carpeta,
+    cliente: o.cliente || p.cliente_final || undefined,
+    situacion: o.situacion,
+    etapa_hubspot: o.etapa || undefined,
+    anio: o._anio,
+    pais: o.pais,
+    comercial: o.comercial || undefined,
+    carpeta_box: o.enlace_box,
+    carpetas_gemelas: o.carpetas_gemelas ? o.carpetas_gemelas.split(" ").map((id) => `https://app.box.com/folder/${id}`) : undefined,
+  };
+  if (o.propuesta)
+    out.propuesta = {
+      titulo: p.titulo,
+      tipo: p.tipo,
+      que_se_propuso: p.que_se_propuso,
+      vehiculo: p.vehiculo,
+      vehiculo_descripcion: detalle ? p.vehiculo_descripcion : undefined,
+      formato: p.formato,
+      ambito: p.ambito_geografico,
+      ...(detalle
+        ? {
+            agencia: p.agencia_intermediaria, concepto: p.concepto_creativo, tematicas: p.tematicas, publico: p.publico,
+            duracion: p.duracion, experiencia: p.elementos_experiencia, concurso_publico: p.concurso_publico,
+            organismo_y_expediente: p.organismo_y_expediente, criterios: p.criterios_adjudicacion,
+            calidad_ficha: p.calidad_informacion, notas: p.notas,
+          }
+        : {}),
+      documentos: docs(p.documentos).slice(0, detalle ? 10 : 3),
+    };
+  if (o.proyecto)
+    out.proyecto = {
+      resumen: y.resumen,
+      fechas: y.fechas,
+      vehiculo: y.vehiculo,
+      recorrido: lst(y.recorrido).slice(0, detalle ? 60 : 12),
+      paradas: y.paradas ?? undefined,
+      visitantes: y.visitantes_total ?? undefined,
+      visitantes_detalle: y.visitantes_detalle,
+      ...(detalle
+        ? {
+            resultados: y.resultados, experiencia: y.experiencia, permisos: y.permisos_y_tramites,
+            proveedores: y.proveedores_y_socios, incidencias_y_aprendizajes: y.incidencias_y_aprendizajes,
+            calidad_ficha: y.calidad_informacion, documentos: docs(y.documentos),
+          }
+        : {}),
+    };
+  if (o.mapa && detalle)
+    out.documentacion = {
+      como_esta_organizada: m.resumen_estructura,
+      secciones: (m.secciones || [])
+        .filter((s) => !(limitado && s.categoria === "contrato y facturación"))
+        .map((s) => ({ categoria: s.categoria, rutas: lst(s.rutas), descripcion: s.descripcion })),
+      documentos_clave: docs(m.documentos_clave),
+    };
+  if (o.fotos_en_box)
+    out.fotos = `${o.fotos_en_box} fotos en la carpeta del proyecto; para verlas usa buscar_fotos con cliente o campaña`;
+  if (!limitado && o.economico) {
+    const e = o.economico;
+    const eco = {
+      importe_negocio_hubspot: e.importe_negocio ? Number(e.importe_negocio) : undefined,
+      importe_propuesto: e.importe_propuesto ?? undefined,
+      desglose: detalle && e.desglose_presupuesto?.length ? e.desglose_presupuesto : undefined,
+    };
+    if (Object.values(eco).some((v) => v !== undefined)) out.economico = eco;
+  }
+  return JSON.parse(JSON.stringify(out)); // quita los undefined
+}
+
 const contar = (lista, clave) => {
   const c = new Map();
   for (const f of lista) for (const v of [].concat(clave(f) || [])) if (v) c.set(v, (c.get(v) || 0) + 1);
@@ -527,7 +663,7 @@ const safe = (fn) => async (args) => {
 
 // conMiniaturas: solo para clientes que muestran imágenes Markdown externas (Open WebUI…), pedido con
 // ?miniaturas=1 en la URL del conector. claude.ai no las carga, así que allí todo sigue como antes.
-function buildServer({ conMiniaturas = false } = {}) {
+function buildServer({ conMiniaturas = false, nivel = "completo" } = {}) {
   const server = new McpServer({ name: "Box_alegria", version: "2.0.0" });
   const M = miniaturasActivas && conMiniaturas;
   const lista = (it) => (M ? slimConMiniatura(it) : slim(it));
@@ -905,6 +1041,91 @@ function buildServer({ conMiniaturas = false } = {}) {
   );
 
   server.registerTool(
+    "buscar_oportunidades",
+    {
+      title: "Buscar oportunidades (qué presentamos y qué hicimos)",
+      description:
+        "Busca en el índice de oportunidades comerciales de alegria-activity: unas 1.250 oportunidades de 2015 a hoy " +
+        "que cruzan HubSpot (estado: ganada, perdida, dormida, en curso; cliente; comercial) con su carpeta de Box " +
+        "(0.Salesforce/Oportunidades) y fichas hechas leyendo los documentos: qué se le presentó al cliente " +
+        "(dossier, presupuesto, pliegos) y, en las ganadas, qué se hizo (recorrido, fechas, visitantes, permisos, " +
+        "resultados) y dónde está cada documento (rutas, permisos, planos, informes, fotos). Úsala para '¿qué le " +
+        "presentamos a X?', '¿qué hicimos con Y?', 'campañas con el 13,80 en Polonia', 'dónde está la ruta de Z'. " +
+        "Sin detalle devuelve un resumen por oportunidad; con detalle=true, la ficha completa con secciones de " +
+        "documentación y enlaces. Las fichas son automáticas: cita la fuente y no afirmes lo que no diga. Si una " +
+        "ganada no tiene documentación, puede estar en su carpeta gemela o en la de otro año (prórroga).",
+      inputSchema: {
+        texto: z.string().optional().describe("Palabras clave: tema, formato, ciudad… p. ej. 'escape room educación financiera', 'bibliobús'"),
+        cliente: z.string().optional().describe("Cliente, organismo, agencia o nombre de la oportunidad (texto parcial)"),
+        situacion: z.enum(["ganada", "perdida", "dormida", "en curso", "sin negocio"]).optional()
+          .describe("Estado del negocio en HubSpot"),
+        solo_con_proyecto: z.boolean().default(false).describe("Solo las que tienen ficha de proyecto realizado"),
+        vehiculo: z.string().optional().describe("13,80, Semirremolque, Furgón, Airstream, Camión rígido… o 'fabricada a medida'"),
+        tipo: z.enum(["campaña o servicio", "venta o fabricación de unidad móvil", "alquiler", "mixto"]).optional(),
+        pais: z.string().optional().describe("España, Francia, Polonia, Marruecos…"),
+        anio_desde: z.number().int().optional(),
+        anio_hasta: z.number().int().optional(),
+        orden: z.enum(["relevancia", "recientes"]).default("relevancia"),
+        detalle: z.boolean().default(false).describe("Ficha completa (úsalo con 1-3 oportunidades)"),
+        limit: z.number().int().min(1).max(20).default(6),
+        offset: z.number().int().min(0).default(0),
+      },
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    safe(async (a) => {
+      if (!CFG.oportunidadesUrl) return fail("El buscador de oportunidades no está configurado (falta INDICE_OPORTUNIDADES_URL).");
+      if (!oportunidades.lista.length) {
+        await cargarOportunidades();
+        if (!oportunidades.lista.length)
+          return fail(`El índice de oportunidades no está disponible${oportunidades.error ? `: ${oportunidades.error}` : ""}.`);
+      }
+      const nc = a.cliente ? norm(a.cliente) : null;
+      const nv = a.vehiculo ? norm(a.vehiculo) : null;
+      const np = a.pais ? norm(a.pais) : null;
+      const base = oportunidades.lista.filter((o) => {
+        if (nc && !norm(`${o.cliente} ${o.carpeta} ${o.negocio} ${o.propuesta?.cliente_final} ${o.propuesta?.agencia_intermediaria} ${o.propuesta?.titulo}`).includes(nc)) return false;
+        if (a.situacion && o._grupo !== a.situacion.split(" ")[0]) return false;
+        if (a.solo_con_proyecto && !o.proyecto) return false;
+        if (nv && !o._vehiculos.some((v) => norm(v).includes(nv))) return false;
+        if (a.tipo && o.propuesta?.tipo !== a.tipo) return false;
+        if (np && !norm(o.pais).includes(np)) return false;
+        if (a.anio_desde && !(o._anio >= a.anio_desde)) return false;
+        if (a.anio_hasta && !(o._anio <= a.anio_hasta)) return false;
+        return true;
+      });
+      const recientes = (x, y) => (y._anio || 0) - (x._anio || 0);
+      const terminos = palabras(a.texto);
+      let lista = base;
+      if (terminos.length) {
+        const minimo = Math.max(1, Math.ceil(terminos.length / 2));
+        const puntuados = base.map((o) => ({ o, ...puntuar(o, terminos) })).filter((x) => x.encontrados >= minimo);
+        puntuados.sort((x, y) =>
+          a.orden === "recientes"
+            ? recientes(x.o, y.o) || y.total - x.total
+            : y.encontrados - x.encontrados || y.total - x.total || (y.o.proyecto ? 1 : 0) - (x.o.proyecto ? 1 : 0) || recientes(x.o, y.o)
+        );
+        lista = puntuados.map((x) => x.o);
+      } else {
+        lista = [...base].sort((x, y) => recientes(x, y) || (y.proyecto ? 1 : 0) - (x.proyecto ? 1 : 0));
+      }
+      const limitado = nivel === "limitado";
+      return ok({
+        total: lista.length,
+        offset: a.offset,
+        mostrando: Math.min(a.limit, Math.max(0, lista.length - a.offset)),
+        acceso: limitado ? "limitado (sin importes ni documentos económicos)" : "completo",
+        resumen: {
+          por_situacion: contar(lista, (o) => o._grupo),
+          por_anio: contar(lista, (o) => (o._anio ? String(o._anio) : null)),
+          por_vehiculo: contar(lista, (o) => o._vehiculos),
+        },
+        indice: { oportunidades: oportunidades.lista.length, generado: oportunidades.generado },
+        oportunidades: lista.slice(a.offset, a.offset + a.limit).map((o) => fichaOportunidad(o, { detalle: a.detalle, limitado })),
+      });
+    })
+  );
+
+  server.registerTool(
     "buscar_catalogos",
     {
       title: "Buscar catálogos, magazine y presentación corporativa",
@@ -1009,12 +1230,23 @@ function buildServer({ conMiniaturas = false } = {}) {
 // ---------------------------------------------------------------------------
 // HTTP
 // ---------------------------------------------------------------------------
-function secretMatches(given) {
-  if (CFG.allowNoAuth && !CFG.mcpSecret) return true;
-  if (!given) return false;
+function igual(given, secreto) {
+  if (!given || !secreto) return false;
   const a = crypto.createHash("sha256").update(given).digest();
-  const b = crypto.createHash("sha256").update(CFG.mcpSecret).digest();
+  const b = crypto.createHash("sha256").update(secreto).digest();
   return crypto.timingSafeEqual(a, b);
+}
+
+// "completo" con MCP_SECRET, "limitado" con MCP_SECRET_LIMITADO, null si no vale
+function nivelDe(given) {
+  if (CFG.allowNoAuth && !CFG.mcpSecret) return "completo";
+  if (igual(given, CFG.mcpSecret)) return "completo";
+  if (igual(given, CFG.mcpSecretLimitado)) return "limitado";
+  return null;
+}
+
+function secretMatches(given) {
+  return nivelDe(given) === "completo";
 }
 
 const app = express();
@@ -1042,6 +1274,10 @@ app.get(["/health/box/:key", "/health/box"], async (req, res) => {
       indice_dossieres: CFG.dossieresUrl
         ? { dossieres: dossieres.lista.length, generado: dossieres.generado, cargado_en: dossieres.cargadoEn, error: dossieres.error }
         : "no configurado",
+      indice_oportunidades: CFG.oportunidadesUrl
+        ? { oportunidades: oportunidades.lista.length, generado: oportunidades.generado, cargado_en: oportunidades.cargadoEn, error: oportunidades.error }
+        : "no configurado",
+      acceso_limitado: CFG.mcpSecretLimitado ? "configurado (MCP_SECRET_LIMITADO)" : "no configurado",
       indice_catalogos: CFG.catalogosUrl
         ? { catalogos: catalogos.lista.length, generado: catalogos.generado, cargado_en: catalogos.cargadoEn, error: catalogos.error }
         : "no configurado",
@@ -1061,7 +1297,8 @@ app.get(["/health/box/:key", "/health/box"], async (req, res) => {
 
 async function handleMcp(req, res) {
   const key = req.params.key || (req.get("authorization") || "").replace(/^Bearer\s+/i, "");
-  if (!secretMatches(key)) {
+  const nivel = nivelDe(key);
+  if (!nivel) {
     return res.status(401).json({ jsonrpc: "2.0", error: { code: -32001, message: "Unauthorized" }, id: null });
   }
   if (req.method !== "POST") {
@@ -1069,7 +1306,7 @@ async function handleMcp(req, res) {
     return res.status(405).set("Allow", "POST").json({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed" }, id: null });
   }
   const flag = String(req.query.miniaturas || "").toLowerCase();
-  const server = buildServer({ conMiniaturas: ["1", "true", "si", "sí"].includes(flag) });
+  const server = buildServer({ conMiniaturas: ["1", "true", "si", "sí"].includes(flag), nivel });
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
   res.on("close", () => {
     transport.close();
@@ -1118,6 +1355,10 @@ if (CFG.indiceUrl) {
 if (CFG.dossieresUrl) {
   cargarDossieres();
   setInterval(cargarDossieres, Math.max(5, CFG.indiceRefrescoMin) * 60_000).unref();
+}
+if (CFG.oportunidadesUrl) {
+  cargarOportunidades();
+  setInterval(cargarOportunidades, Math.max(5, CFG.indiceRefrescoMin) * 60_000).unref();
 }
 if (CFG.catalogosUrl) {
   cargarCatalogos();
