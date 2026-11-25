@@ -1040,7 +1040,8 @@ function buildServer({ conMiniaturas = false, nivel = "completo" } = {}) {
     })
   );
 
-  server.registerTool(
+  // Solo se ofrece si el servicio tiene el índice configurado (así no aparece una herramienta rota).
+  if (CFG.oportunidadesUrl) server.registerTool(
     "buscar_oportunidades",
     {
       title: "Buscar oportunidades (qué presentamos y qué hicimos)",
